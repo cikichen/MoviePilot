@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Optional, List, Tuple, Union, Dict, Callable
 
+from app.chain.tmdb import TmdbChain
 from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.meta import MetaBase
@@ -35,7 +36,7 @@ class FileManagerModule(_ModuleBase):
         self._storage_schemas = ModuleHelper.load('app.modules.filemanager.storages',
                                                   filter_func=lambda _, obj: hasattr(obj, 'schema') and obj.schema)
         # 获取存储类型
-        self._support_storages = [storage.schema.value for storage in self._storage_schemas]
+        self._support_storages = [storage.schema.value for storage in self._storage_schemas if storage.schema]
 
     @staticmethod
     def get_name() -> str:
@@ -80,26 +81,26 @@ class FileManagerModule(_ModuleBase):
                 return False, f"{d.name} 的下载目录未设置"
             if d.storage == "local" and not Path(download_path).exists():
                 return False, f"{d.name} 的下载目录 {download_path} 不存在"
-            # 媒体库目录
+            # 仅在启用整理时检查媒体库目录
             library_path = d.library_path
-            if not library_path:
-                return False, f"{d.name} 的媒体库目录未设置"
-            if d.library_storage == "local" and not Path(library_path).exists():
-                return False, f"{d.name} 的媒体库目录 {library_path} 不存在"
-            # 硬链接
-            if d.transfer_type == "link" \
-                    and d.storage == "local" \
-                    and d.library_storage == "local" \
-                    and not SystemUtils.is_same_disk(Path(download_path), Path(library_path)):
-                return False, f"{d.name} 的下载目录 {download_path} 与媒体库目录 {library_path} 不在同一磁盘，无法硬链接"
+            if d.transfer_type:
+                if not library_path:
+                    return False, f"{d.name} 的媒体库目录未设置"
+                if d.library_storage == "local" and not Path(library_path).exists():
+                    return False, f"{d.name} 的媒体库目录 {library_path} 不存在"
+                # 硬链接
+                if d.transfer_type == "link" \
+                        and d.storage == "local" \
+                        and d.library_storage == "local" \
+                        and not SystemUtils.is_same_disk(Path(download_path), Path(library_path)):
+                    return False, f"{d.name} 的下载目录 {download_path} 与媒体库目录 {library_path} 不在同一磁盘，无法硬链接"
             # 存储
             storage_oper = self.__get_storage_oper(d.storage)
-            if not storage_oper:
-                return False, f"{d.name} 的存储类型 {d.storage} 不支持"
-            if not storage_oper.check():
-                return False, f"{d.name} 的存储测试不通过"
-            if d.transfer_type and d.transfer_type not in storage_oper.support_transtype():
-                return False, f"{d.name} 的存储不支持 {d.transfer_type} 整理方式"
+            if storage_oper:
+                if not storage_oper.check():
+                    return False, f"{d.name} 的存储测试不通过"
+                if d.transfer_type and d.transfer_type not in storage_oper.support_transtype():
+                    return False, f"{d.name} 的存储不支持 {d.transfer_type} 整理方式"
 
         return True, ""
 
@@ -139,16 +140,32 @@ class FileManagerModule(_ModuleBase):
         """
         handler = TransHandler()
         # 重命名格式
-        rename_format = settings.TV_RENAME_FORMAT \
-            if mediainfo.type == MediaType.TV else settings.MOVIE_RENAME_FORMAT
+        rename_format = settings.RENAME_FORMAT(mediainfo.type)
+        # 获取集信息
+        episodes_info: Optional[List[TmdbEpisode]] = None
+        if mediainfo.type == MediaType.TV:
+            # 判断注意season为0的情况
+            season_num = mediainfo.season
+            if season_num is None and meta.season_seq:
+                if meta.season_seq.isdigit():
+                    season_num = int(meta.season_seq)
+            # 默认值1
+            if season_num is None:
+                season_num = 1
+            episodes_info = TmdbChain().tmdb_episodes(
+                tmdbid=mediainfo.tmdb_id,
+                season=season_num,
+                episode_group=mediainfo.episode_group,
+            )
         # 获取重命名后的名称
         path = handler.get_rename_path(
             template_string=rename_format,
             rename_dict=handler.get_naming_dict(meta=meta,
                                                 mediainfo=mediainfo,
+                                                episodes_info=episodes_info,
                                                 file_ext=Path(meta.title).suffix)
         )
-        return str(path)
+        return path.as_posix() if path else ""
 
     def save_config(self, storage: str, conf: Dict) -> None:
         """
@@ -179,6 +196,16 @@ class FileManagerModule(_ModuleBase):
             logger.error(f"不支持 {storage} 的二维码生成")
             return None
         return storage_oper.generate_qrcode()
+
+    def generate_auth_url(self, storage: str) -> Optional[Tuple[dict, str]]:
+        """
+        生成 OAuth2 授权 URL
+        """
+        storage_oper = self.__get_storage_oper(storage, "generate_auth_url")
+        if not storage_oper:
+            logger.error(f"不支持 {storage} 的 OAuth2 授权")
+            return {}, f"不支持 {storage} 的 OAuth2 授权"
+        return storage_oper.generate_auth_url()
 
     def check_login(self, storage: str, **kwargs) -> Optional[Dict[str, str]]:
         """
@@ -272,6 +299,18 @@ class FileManagerModule(_ModuleBase):
             return None
         return storage_oper.create_folder(fileitem, name)
 
+    def get_folder(self, storage: str, path: Path) -> Optional[FileItem]:
+        """
+        获取目录，如目录不存在则创建
+        """
+        if storage not in self._support_storages:
+            return None
+        storage_oper = self.__get_storage_oper(storage)
+        if not storage_oper:
+            logger.error(f"不支持 {storage} 的目录获取")
+            return None
+        return storage_oper.get_folder(path)
+
     def delete_file(self, fileitem: FileItem) -> Optional[bool]:
         """
         删除文件或目录
@@ -344,9 +383,14 @@ class FileManagerModule(_ModuleBase):
             return None
         return storage_oper.get_parent(fileitem)
 
-    def snapshot_storage(self, storage: str, path: Path) -> Optional[Dict[str, float]]:
+    def snapshot_storage(self, storage: str, path: Path,
+                         last_snapshot_time: float = None, max_depth: int = 5) -> Optional[Dict[str, Dict]]:
         """
         快照存储
+        :param storage: 存储类型
+        :param path: 路径
+        :param last_snapshot_time: 上次快照时间，用于增量快照
+        :param max_depth: 最大递归深度，避免过深遍历
         """
         if storage not in self._support_storages:
             return None
@@ -354,7 +398,7 @@ class FileManagerModule(_ModuleBase):
         if not storage_oper:
             logger.error(f"不支持 {storage} 的快照处理")
             return None
-        return storage_oper.snapshot(path)
+        return storage_oper.snapshot(path, last_snapshot_time=last_snapshot_time, max_depth=max_depth)
 
     def storage_usage(self, storage: str) -> Optional[StorageUsage]:
         """
@@ -374,7 +418,8 @@ class FileManagerModule(_ModuleBase):
                  transfer_type: Optional[str] = None, scrape: Optional[bool] = None,
                  library_type_folder: Optional[bool] = None, library_category_folder: Optional[bool] = None,
                  episodes_info: List[TmdbEpisode] = None,
-                 source_oper: Callable = None, target_oper: Callable = None) -> TransferInfo:
+                 source_oper: Callable = None, target_oper: Callable = None,
+                 preview: Optional[bool] = False) -> TransferInfo:
         """
         文件整理
         :param fileitem:  文件信息
@@ -406,6 +451,12 @@ class FileManagerModule(_ModuleBase):
                                 message=f"{target_path} 不是有效目录")
         # 获取目标路径
         if target_directory:
+            # 目标媒体库目录未设置
+            if not target_directory.library_path:
+                logger.error(f"目标媒体库目录未设置，无法整理文件，源路径：{fileitem.path}")
+                return TransferInfo(success=False,
+                                    fileitem=fileitem,
+                                    message="目标媒体库目录未设置")
             # 整理方式
             if not transfer_type:
                 transfer_type = target_directory.transfer_type
@@ -436,7 +487,7 @@ class FileManagerModule(_ModuleBase):
         else:
             # 未找到有效的媒体库目录
             logger.error(
-                f"{mediainfo.type.value} {mediainfo.title_year} 未找到有效的媒体库目录，无法整理文件，源路径：{fileitem.path}")
+                f"{mediainfo.type.value if mediainfo.type else '未知类型'} {mediainfo.title_year} 未找到有效的媒体库目录，无法整理文件，源路径：{fileitem.path}")
             return TransferInfo(success=False,
                                 fileitem=fileitem,
                                 message="未找到有效的媒体库目录")
@@ -484,6 +535,7 @@ class FileManagerModule(_ModuleBase):
                                       need_notify=need_notify,
                                       overwrite_mode=overwrite_mode,
                                       episodes_info=episodes_info,
+                                      preview=preview,
                                       source_oper=source_oper,
                                       target_oper=target_oper)
 
@@ -505,19 +557,35 @@ class FileManagerModule(_ModuleBase):
             # 媒体分类路径
             dir_path = handler.get_dest_dir(mediainfo=mediainfo, target_dir=dest_dir)
             # 重命名格式
-            rename_format = settings.TV_RENAME_FORMAT \
-                if mediainfo.type == MediaType.TV else settings.MOVIE_RENAME_FORMAT
+            rename_format = settings.RENAME_FORMAT(mediainfo.type)
+            # 元数据补上常用属性，尽可能确保重命名后的路径不出现空白
+            meta = MetaInfo(mediainfo.title)
+            if meta.type == MediaType.UNKNOWN and mediainfo.type is not None:
+                meta.type = mediainfo.type
+            if meta.year is None:
+                meta.year = mediainfo.year
+            if meta.begin_season is None:
+                meta.begin_season = 1
+            if meta.begin_episode is None:
+                meta.begin_episode = 1
             # 获取路径（重命名路径）
             target_path = handler.get_rename_path(
                 path=dir_path,
                 template_string=rename_format,
-                rename_dict=handler.get_naming_dict(meta=MetaInfo(mediainfo.title),
+                rename_dict=handler.get_naming_dict(meta=meta,
                                                     mediainfo=mediainfo)
             )
-            # 计算重命名中的文件夹层数
-            rename_format_level = len(rename_format.split("/")) - 1
-            # 取相对路径的第1层目录
-            media_path = target_path.parents[rename_format_level - 1]
+            # 获取重命名后的媒体文件根路径
+            media_path = DirectoryHelper.get_media_root_path(
+                rename_format, rename_path=target_path
+            )
+            if not media_path:
+                # 忽略
+                continue
+            if dir_path != media_path and dir_path.is_relative_to(media_path):
+                # 兜底检查，避免不必要的扫盘
+                logger.warn(f"{media_path} 是媒体库目录 {dir_path} 的父目录，忽略获取媒体文件列表，请检查重命名格式！")
+                continue
             # 检索媒体文件
             fileitem = storage_oper.get_item(media_path)
             if not fileitem:
@@ -543,9 +611,12 @@ class FileManagerModule(_ModuleBase):
         if not settings.LOCAL_EXISTS_SEARCH:
             return None
 
+        logger.debug(f"正在本地媒体库中查找 {mediainfo.title_year}...")
+
         # 检查媒体库
         fileitems = self.media_files(mediainfo)
         if not fileitems:
+            logger.debug(f"{mediainfo.title_year} 不在本地媒体库中")
             return None
 
         if mediainfo.type == MediaType.MOVIE:

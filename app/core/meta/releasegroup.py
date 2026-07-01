@@ -9,7 +9,6 @@ class ReleaseGroupsMatcher(metaclass=Singleton):
     """
     识别制作组、字幕组
     """
-    __release_groups: str = None
     # 内置组
     RELEASE_GROUPS: dict = {
         "0ff": ['FF(?:(?:A|WE)B|CD|E(?:DU|B)|TV)'],
@@ -48,11 +47,12 @@ class ReleaseGroupsMatcher(metaclass=Singleton):
         "joyhd": [],
         "keepfrds": ['FRDS', 'Yumi', 'cXcY'],
         "lemonhd": ['L(?:eague(?:(?:C|H)D|(?:M|T)V|NF|WEB)|HD)', 'i18n', 'CiNT'],
-        "mteam": ['MTeam(?:TV|)', 'MPAD'],
+        "mteam": ['MTeam(?:TV|)', 'MPAD', 'MWeb'],
         "nanyangpt": [],
         "nicept": [],
         "oshen": [],
         "ourbits": ['Our(?:Bits|TV)', 'FLTTH', 'Ao', 'PbK', 'MGs', 'iLove(?:HD|TV)'],
+        "panda": ['Panda', 'AilMWeb'],
         "piggo": ['PiGo(?:NF|(?:H|WE)B)'],
         "ptchina": [],
         "pterclub": ['PTer(?:DIY|Game|(?:M|T)V|WEB|)'],
@@ -70,7 +70,7 @@ class ReleaseGroupsMatcher(metaclass=Singleton):
         "U2": [],
         "ultrahd": [],
         "others": ['B(?:MDru|eyondHD|TN)', 'C(?:fandora|trlhd|MRG)', 'DON', 'EVO', 'FLUX', 'HONE(?:yG|)',
-                   'N(?:oGroup|T(?:b|G))', 'PandaMoon', 'SMURF', 'T(?:EPES|aengoo|rollHD )',],
+                   'N(?:oGroup|T(?:b|G))', 'PandaMoon', 'SMURF', 'T(?:EPES|aengoo|rollHD )'],
         "anime": ['ANi', 'HYSUB', 'KTXP', 'LoliHouse', 'MCE', 'Nekomoe kissaten', 'SweetSub', 'MingY',
                   '(?:Lilith|NC)-Raws', '织梦字幕组', '枫叶字幕组', '猎户手抄部', '喵萌奶茶屋', '漫猫字幕社',
                   '霜庭云花Sub', '北宇治字幕组', '氢气烤肉架', '云歌字幕组', '萌樱字幕组', '极影字幕社',
@@ -86,6 +86,18 @@ class ReleaseGroupsMatcher(metaclass=Singleton):
             for release_group in site_groups:
                 release_groups.append(release_group)
         self.__release_groups = '|'.join(release_groups)
+        self.systemconfig = SystemConfigOper()
+        self.__groups_re_cache = {}
+
+    def __get_groups_re(self, groups: str):
+        """
+        发布组规则通常很长，按规则文本缓存编译结果，避免每个标题都重复编译。
+        """
+        groups_re = self.__groups_re_cache.get(groups)
+        if not groups_re:
+            groups_re = re.compile(r"(?<=[-@\[￡【&])(?:(?:%s))(?=$|[@.\s\]\[】&])" % groups, re.I)
+            self.__groups_re_cache[groups] = groups_re
+        return groups_re
 
     def match(self, title: str = None, groups: str = None):
         """
@@ -97,7 +109,7 @@ class ReleaseGroupsMatcher(metaclass=Singleton):
             return ""
         if not groups:
             # 自定义组
-            custom_release_groups = SystemConfigOper().get(SystemConfigKey.CustomReleaseGroups)
+            custom_release_groups = self.systemconfig.get(SystemConfigKey.CustomReleaseGroups)
             if isinstance(custom_release_groups, list):
                 custom_release_groups = list(filter(None, custom_release_groups))
             if custom_release_groups:
@@ -106,10 +118,11 @@ class ReleaseGroupsMatcher(metaclass=Singleton):
             else:
                 groups = self.__release_groups
         title = f"{title} "
-        groups_re = re.compile(r"(?<=[-@\[￡【&])(?:%s)(?=[@.\s\S\]\[】&])" % groups, re.I)
-        # 处理一个制作组识别多次的情况，保留顺序
+        groups_re = self.__get_groups_re(groups)
         unique_groups = []
-        for item in re.findall(groups_re, title):
-            if item not in unique_groups:
-                unique_groups.append(item)
+        for item in groups_re.findall(title):
+            item_str = item[0] if isinstance(item, tuple) else item
+            if item_str not in unique_groups:
+                unique_groups.append(item_str)
+
         return "@".join(unique_groups)

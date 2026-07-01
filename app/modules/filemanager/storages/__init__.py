@@ -1,9 +1,39 @@
 from abc import ABCMeta, abstractmethod
-from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Optional, List, Dict, Tuple, Callable, Union
+
+from tqdm import tqdm
 
 from app import schemas
+from app.helper.progress import ProgressHelper
 from app.helper.storage import StorageHelper
+from app.log import logger
+from app.utils.crypto import HashUtils
+
+
+def transfer_process(path: str) -> Callable[[int | float], None]:
+    """
+    传输进度回调
+    """
+    pbar = tqdm(total=100, desc="进度", unit="%")
+    progress = ProgressHelper(HashUtils.md5(path))
+    progress.start()
+
+    def update_progress(percent: Union[int, float]) -> None:
+        """
+        更新进度百分比
+        """
+        percent_value = round(percent, 2) if isinstance(percent, float) else percent
+        pbar.n = percent_value
+        # 更新进度
+        pbar.refresh()
+        progress.update(value=percent_value, text=f"{path} 进度：{percent_value}%")
+        # 完成时结束
+        if percent_value >= 100:
+            progress.end()
+            pbar.close()
+
+    return update_progress
 
 
 class StorageBase(metaclass=ABCMeta):
@@ -12,6 +42,7 @@ class StorageBase(metaclass=ABCMeta):
     """
     schema = None
     transtype = {}
+    snapshot_check_folder_modtime = True
 
     def __init__(self):
         self.storagehelper = StorageHelper()
@@ -25,6 +56,12 @@ class StorageBase(metaclass=ABCMeta):
 
     def generate_qrcode(self, *args, **kwargs) -> Optional[Tuple[dict, str]]:
         pass
+
+    def generate_auth_url(self, *args, **kwargs) -> Optional[Tuple[dict, str]]:
+        """
+        生成 OAuth2 授权 URL
+        """
+        return {}, "此存储不支持 OAuth2 授权"
 
     def check_login(self, *args, **kwargs) -> Optional[Dict[str, str]]:
         pass
@@ -67,6 +104,38 @@ class StorageBase(metaclass=ABCMeta):
         """
         self.storagehelper.reset_storage(self.schema.value)
         self.init_storage()
+
+    @staticmethod
+    def _safe_download_name(name: Optional[str]) -> Optional[str]:
+        """
+        提取可安全落盘的文件名。
+        """
+        if not name:
+            return None
+
+        safe_name = PurePosixPath(str(name).replace("\\", "/")).name
+        if safe_name in ("", ".", ".."):
+            return None
+        return safe_name
+
+    def _build_download_path(
+        self, fileitem: schemas.FileItem, path: Path
+    ) -> Optional[Path]:
+        """
+        构造本地下载路径，避免远端文件名携带目录片段时越过目标目录。
+        """
+        safe_name = self._safe_download_name(fileitem.name)
+        if not safe_name:
+            logger.error(f"【存储】下载文件名无效：{fileitem.name}")
+            return None
+
+        local_path = path / safe_name
+        try:
+            local_path.resolve().relative_to(path.resolve())
+        except ValueError:
+            logger.error(f"【存储】下载路径越界：{fileitem.name} -> {local_path}")
+            return None
+        return local_path
 
     @abstractmethod
     def check(self) -> bool:
@@ -135,7 +204,8 @@ class StorageBase(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def upload(self, fileitem: schemas.FileItem, path: Path, new_name: Optional[str] = None) -> Optional[schemas.FileItem]:
+    def upload(self, fileitem: schemas.FileItem, path: Path,
+               new_name: Optional[str] = None) -> Optional[schemas.FileItem]:
         """
         上传文件
         :param fileitem: 上传目录项
@@ -192,21 +262,46 @@ class StorageBase(metaclass=ABCMeta):
         """
         pass
 
-    def snapshot(self, path: Path) -> Dict[str, float]:
+    def snapshot(self, path: Path, last_snapshot_time: float = None, max_depth: int = 5) -> Dict[str, Dict]:
         """
         快照文件系统，输出所有层级文件信息（不含目录）
+        :param path: 路径
+        :param last_snapshot_time: 上次快照时间，用于增量快照
+        :param max_depth: 最大递归深度，避免过深遍历
         """
         files_info = {}
 
-        def __snapshot_file(_fileitm: schemas.FileItem):
+        def __snapshot_file(_fileitm: schemas.FileItem, current_depth: int = 0):
             """
             递归获取文件信息
             """
-            if _fileitm.type == "dir":
-                for sub_file in self.list(_fileitm):
-                    __snapshot_file(sub_file)
-            else:
-                files_info[_fileitm.path] = _fileitm.size
+            try:
+                if _fileitm.type == "dir":
+                    # 检查递归深度限制
+                    if current_depth >= max_depth:
+                        return
+
+                    # 增量检查：如果目录修改时间早于上次快照，跳过
+                    if (self.snapshot_check_folder_modtime and
+                            last_snapshot_time and
+                            _fileitm.modify_time and
+                            _fileitm.modify_time <= last_snapshot_time):
+                        return
+
+                    # 遍历子文件
+                    sub_files = self.list(_fileitm)
+                    for sub_file in sub_files:
+                        __snapshot_file(sub_file, current_depth + 1)
+                else:
+                    # 记录文件的完整信息用于比对（始终包含所有文件，由 compare_snapshots 负责检测变化）
+                    files_info[_fileitm.path] = {
+                        'size': _fileitm.size or 0,
+                        'modify_time': getattr(_fileitm, 'modify_time', 0),
+                        'type': _fileitm.type
+                    }
+
+            except Exception as e:
+                logger.debug(f"Snapshot error for {_fileitm.path}: {e}")
 
         fileitem = self.get_item(path)
         if not fileitem:

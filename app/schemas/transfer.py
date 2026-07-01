@@ -3,31 +3,16 @@ from typing import Optional, List, Any, Callable
 
 from pydantic import BaseModel, Field
 
-from app.schemas.tmdb import TmdbEpisode
-from app.schemas.history import DownloadHistory
 from app.schemas.context import MetaInfo, MediaInfo
 from app.schemas.file import FileItem
+from app.schemas.history import DownloadHistory
 from app.schemas.system import TransferDirectoryConf
+from app.schemas.tmdb import TmdbEpisode
 
 
-class TransferTorrent(BaseModel):
+class DownloaderTorrent(BaseModel):
     """
-    待转移任务信息
-    """
-    downloader: Optional[str] = None
-    title: Optional[str] = None
-    path: Optional[Path] = None
-    hash: Optional[str] = None
-    tags: Optional[str] = None
-    size: Optional[int] = 0
-    userid: Optional[str] = None
-    progress: Optional[float] = 0.0
-    state: Optional[str] = None
-
-
-class DownloadingTorrent(BaseModel):
-    """
-    下载中任务信息
+    下载器任务信息
     """
     downloader: Optional[str] = None
     hash: Optional[str] = None
@@ -35,15 +20,37 @@ class DownloadingTorrent(BaseModel):
     name: Optional[str] = None
     year: Optional[str] = None
     season_episode: Optional[str] = None
+    path: Optional[Path] = None
     size: Optional[float] = 0.0
     progress: Optional[float] = 0.0
     state: Optional[str] = 'downloading'
     upspeed: Optional[str] = None
     dlspeed: Optional[str] = None
+    tags: Optional[str] = None
+    save_path: Optional[str] = None
+    content_path: Optional[str] = None
+    category: Optional[str] = None
+    download_limit: Optional[float] = None
+    upload_limit: Optional[float] = None
+    ratio_limit: Optional[float] = None
+    seeding_time_limit: Optional[int] = None
+    trackers: Optional[List[str]] = Field(default_factory=list)
     media: Optional[dict] = Field(default_factory=dict)
     userid: Optional[str] = None
     username: Optional[str] = None
     left_time: Optional[str] = None
+
+
+class TransferTorrent(DownloaderTorrent):
+    """
+    待转移任务信息
+    """
+
+
+class DownloadingTorrent(DownloaderTorrent):
+    """
+    下载中任务信息
+    """
 
 
 class TransferTask(BaseModel):
@@ -65,18 +72,20 @@ class TransferTask(BaseModel):
     downloader: Optional[str] = None
     download_hash: Optional[str] = None
     download_history: Optional[DownloadHistory] = None
+    transfer_batch_id: Optional[str] = None
     manual: Optional[bool] = False
     background: Optional[bool] = True
+    preview: Optional[bool] = False
 
     def to_dict(self):
         """
         返回字典
         """
         dicts = vars(self).copy()
-        dicts["fileitem"] = self.fileitem.dict() if self.fileitem else None
-        dicts["meta"] = self.meta.dict() if self.meta else None
-        dicts["mediainfo"] = self.mediainfo.dict() if self.mediainfo else None
-        dicts["target_directory"] = self.target_directory.dict() if self.target_directory else None
+        dicts["fileitem"] = self.fileitem.model_dump() if self.fileitem else None
+        dicts["meta"] = self.meta.model_dump() if self.meta else None
+        dicts["mediainfo"] = self.mediainfo.model_dump() if self.mediainfo else None
+        dicts["target_directory"] = self.target_directory.model_dump() if self.target_directory else None
         return dicts
 
 
@@ -108,7 +117,7 @@ class TransferInfo(BaseModel):
     success: bool = True
     # 整理⼁路径
     fileitem: Optional[FileItem] = None
-    # 转移后的目录项
+    # 转移后的目录项，媒体的根目录
     target_diritem: Optional[FileItem] = None
     # 转移后路径
     target_item: Optional[FileItem] = None
@@ -124,14 +133,6 @@ class TransferInfo(BaseModel):
     total_size: Optional[int] = Field(default=0)
     # 失败清单
     fail_list: Optional[list] = Field(default_factory=list)
-    # 处理字幕文件清单
-    subtitle_list: Optional[list] = Field(default_factory=list)
-    # 目标字幕文件清单
-    subtitle_list_new: Optional[list] = Field(default_factory=list)
-    # 处理音频文件清单
-    audio_list: Optional[list] = Field(default_factory=list)
-    # 目标音频文件清单
-    audio_list_new: Optional[list] = Field(default_factory=list)
     # 错误信息
     message: Optional[str] = None
     # 是否需要刮削
@@ -144,8 +145,8 @@ class TransferInfo(BaseModel):
         返回字典
         """
         dicts = vars(self).copy()
-        dicts["fileitem"] = self.fileitem.dict() if self.fileitem else None
-        dicts["target_item"] = self.target_item.dict() if self.target_item else None
+        dicts["fileitem"] = self.fileitem.model_dump() if self.fileitem else None
+        dicts["target_item"] = self.target_item.model_dump() if self.target_item else None
         return dicts
 
 
@@ -171,11 +172,34 @@ class EpisodeFormat(BaseModel):
     offset: Optional[str] = None
 
 
+class EpisodeFormatRule(BaseModel):
+    """
+    集数定位规则
+    """
+    name: str
+    enabled: bool = True
+    order: int = 0
+    pattern: str
+    min_file_size_mb: int = 0
+
+
+class EpisodeFormatRecommendItem(BaseModel):
+    """
+    集数定位推荐请求
+    """
+    fileitem: Optional[FileItem] = None
+    fileitems: Optional[List[FileItem]] = None
+
+
 class ManualTransferItem(BaseModel):
     # 文件项
     fileitem: FileItem = None
+    # 文件项列表（前端多选时传入）
+    fileitems: Optional[List[FileItem]] = None
     # 日志ID
     logid: Optional[int] = None
+    # 日志ID列表（前端多选历史记录时传入）
+    logids: Optional[List[int]] = None
     # 目标存储
     target_storage: Optional[str] = None
     # 目标路径
@@ -201,7 +225,7 @@ class ManualTransferItem(BaseModel):
     # 最小文件大小
     min_filesize: Optional[int] = 0
     # 刮削
-    scrape: bool = False
+    scrape: Optional[bool] = False
     # 媒体库类型子目录
     library_type_folder: Optional[bool] = None
     # 媒体库类别子目录
@@ -210,3 +234,24 @@ class ManualTransferItem(BaseModel):
     from_history: Optional[bool] = False
     # 剧集组
     episode_group: Optional[str] = None
+    # 仅预览，不执行整理
+    preview: Optional[bool] = False
+
+
+class ManualTransferTargetPath(BaseModel):
+    """
+    手动整理目的路径匹配结果
+    """
+
+    # 目标存储
+    target_storage: Optional[str] = None
+    # 目标路径
+    target_path: Optional[str] = None
+    # 整理方式
+    transfer_type: Optional[str] = None
+    # 刮削
+    scrape: Optional[bool] = False
+    # 媒体库类型子目录
+    library_type_folder: Optional[bool] = False
+    # 媒体库类别子目录
+    library_category_folder: Optional[bool] = False

@@ -4,11 +4,11 @@ from typing import Union, Tuple
 from pywebpush import webpush, WebPushException
 
 from app.core.config import global_vars, settings
-from app.core.event import eventmanager, Event
+from app.helper.webpush import is_webpush_subscription_gone, webpush_options_for_endpoint
 from app.log import logger
 from app.modules import _ModuleBase, _MessageBase
-from app.schemas import Notification, ConfigChangeEventData
-from app.schemas.types import ModuleType, MessageChannel, SystemConfigKey, EventType
+from app.schemas import Notification
+from app.schemas.types import ModuleType, MessageChannel
 
 
 class WebPushModule(_ModuleBase, _MessageBase):
@@ -19,20 +19,6 @@ class WebPushModule(_ModuleBase, _MessageBase):
         """
         super().init_service(service_name=self.get_name().lower())
         self._channel = MessageChannel.WebPush
-
-    @eventmanager.register(EventType.ConfigChanged)
-    def handle_config_changed(self, event: Event):
-        """
-        处理配置变更事件
-        :param event: 事件对象
-        """
-        if not event:
-            return
-        event_data: ConfigChangeEventData = event.event_data
-        if event_data.key not in [SystemConfigKey.Notifications.value]:
-            return
-        logger.info("配置变更，重新加载WebPush模块...")
-        self.init_module()
 
     @staticmethod
     def get_name() -> str:
@@ -71,7 +57,7 @@ class WebPushModule(_ModuleBase, _MessageBase):
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
         pass
 
-    def post_message(self, message: Notification) -> None:
+    def post_message(self, message: Notification, **kwargs) -> None:
         """
         发送消息
         :param message: 消息内容
@@ -109,9 +95,12 @@ class WebPushModule(_ModuleBase, _MessageBase):
                             vapid_claims={
                                 "sub": settings.VAPID.get("subject")
                             },
+                            **webpush_options_for_endpoint(sub.get("endpoint")),
                         )
                     except WebPushException as err:
                         logger.error(f"WebPush发送失败: {str(err)}")
+                        if is_webpush_subscription_gone(err) and global_vars.remove_subscription(sub):
+                            logger.info(f"已移除失效WebPush订阅: {sub.get('endpoint')}")
 
             except Exception as msg_e:
                 logger.error(f"发送消息失败：{msg_e}")

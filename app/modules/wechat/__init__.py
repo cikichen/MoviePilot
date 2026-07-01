@@ -1,15 +1,19 @@
 import copy
+import json
+import re
 import xml.dom.minidom
 from typing import Optional, Union, List, Tuple, Any, Dict
+from urllib.parse import quote
 
 from app.core.context import Context, MediaInfo
-from app.core.event import Event, eventmanager
+from app.core.event import eventmanager
 from app.log import logger
 from app.modules import _ModuleBase, _MessageBase
 from app.modules.wechat.WXBizMsgCrypt3 import WXBizMsgCrypt
 from app.modules.wechat.wechat import WeChat
-from app.schemas import MessageChannel, CommingMessage, Notification, CommandRegisterEventData, ConfigChangeEventData
-from app.schemas.types import ModuleType, ChainEventType, SystemConfigKey, EventType
+from app.modules.wechat.wechatbot import WeChatBot
+from app.schemas import MessageChannel, CommingMessage, Notification, CommandRegisterEventData
+from app.schemas.types import ModuleType, ChainEventType
 from app.utils.dom import DomUtils
 from app.utils.structures import DictUtils
 
@@ -20,27 +24,14 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
         """
         初始化模块
         """
+        self.stop()
         super().init_service(service_name=WeChat.__name__.lower(),
-                             service_type=WeChat)
+                             service_type=self._create_client)
         self._channel = MessageChannel.Wechat
-
-    @eventmanager.register(EventType.ConfigChanged)
-    def handle_config_changed(self, event: Event):
-        """
-        处理配置变更事件
-        :param event: 事件对象
-        """
-        if not event:
-            return
-        event_data: ConfigChangeEventData = event.event_data
-        if event_data.key not in [SystemConfigKey.Notifications.value]:
-            return
-        logger.info("配置变更，重新加载Wechat模块...")
-        self.init_module()
 
     @staticmethod
     def get_name() -> str:
-        return "微信"
+        return "企业微信"
 
     @staticmethod
     def get_type() -> ModuleType:
@@ -64,7 +55,45 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
         return 1
 
     def stop(self):
-        pass
+        for client in self.get_instances().values():
+            if hasattr(client, "stop"):
+                try:
+                    client.stop()
+                except Exception as err:
+                    logger.error(f"停止微信模块实例失败：{err}")
+
+    @staticmethod
+    def _is_bot_mode(config: dict) -> bool:
+        return (config or {}).get("WECHAT_MODE", "app") == "bot"
+
+    @staticmethod
+    def _get_admins(config: Optional[dict]) -> List[str]:
+        """
+        解析企业微信管理员配置，兼容逗号分隔和首尾空白。
+        """
+        return [
+            admin.strip()
+            for admin in str((config or {}).get("WECHAT_ADMINS") or "").split(",")
+            if admin.strip()
+        ]
+
+    @classmethod
+    def _should_reject_admin_command(
+            cls, config: Optional[dict], user_id: Optional[str]
+    ) -> bool:
+        """
+        判断企业微信菜单或斜杠命令是否应因非管理员身份被拒绝。
+        """
+        admins = cls._get_admins(config)
+        if not admins:
+            return False
+        return str(user_id or "").strip() not in admins
+
+    @classmethod
+    def _create_client(cls, conf):
+        if cls._is_bot_mode(conf.config):
+            return WeChatBot(name=conf.name, **conf.config)
+        return WeChat(name=conf.name, **conf.config)
 
     def test(self) -> Optional[Tuple[bool, str]]:
         """
@@ -75,7 +104,7 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
         for name, client in self.get_instances().items():
             state = client.get_state()
             if not state:
-                return False, f"企业微信 {name} 未就续"
+                return False, f"企业微信 {name} 未就绪"
         return True, ""
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
@@ -99,6 +128,8 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
             client_config = self.get_config(source)
             if not client_config:
                 return None
+            if self._is_bot_mode(client_config.config):
+                return self._parse_bot_message(source=source, body=body, client_config=client_config)
             client: WeChat = self.get_instance(client_config.name)
             # URL参数
             sVerifyMsgSig = args.get("msg_signature")
@@ -128,7 +159,7 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
             1、消息格式：
             <xml>
                <ToUserName><![CDATA[toUser]]></ToUserName>
-               <FromUserName><![CDATA[fromUser]]></FromUserName> 
+               <FromUserName><![CDATA[fromUser]]></FromUserName>
                <CreateTime>1348831860</CreateTime>
                <MsgType><![CDATA[text]]></MsgType>
                <Content><![CDATA[this is a test]]></Content>
@@ -143,7 +174,7 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
                 <MsgType><![CDATA[event]]></MsgType>
                 <Event><![CDATA[subscribe]]></Event>
                 <AgentID>1</AgentID>
-            </xml>            
+            </xml>
             """
             dom_tree = xml.dom.minidom.parseString(sMsg.decode('UTF-8'))
             root_node = dom_tree.documentElement
@@ -158,14 +189,15 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
                 logger.warn(f"解析不到消息类型和用户ID")
                 return None
             # 解析消息内容
+            content = None
+            images = None
+            audio_refs = None
+            files = None
             if msg_type == "event" and event == "click":
-                # 校验用户有权限执行交互命令
-                if client_config.config.get('WECHAT_ADMINS'):
-                    wechat_admins = client_config.config.get('WECHAT_ADMINS').split(',')
-                    if wechat_admins and not any(
-                            user_id == admin_user for admin_user in wechat_admins):
-                        client.send_msg(title="用户无权限执行菜单命令", userid=user_id)
-                        return None
+                # 企业微信菜单最终会转成命令文本，需与斜杠命令使用一致的管理员校验。
+                if self._should_reject_admin_command(client_config.config, user_id):
+                    client.send_msg(title="只有管理员才有权限执行此命令", userid=user_id)
+                    return None
                 # 根据EventKey执行命令
                 content = DomUtils.tag_value(root_node, "EventKey")
                 logger.info(f"收到来自 {client_config.name} 的微信事件：userid={user_id}, event={content}")
@@ -173,18 +205,128 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
                 # 文本消息
                 content = DomUtils.tag_value(root_node, "Content", default="")
                 logger.info(f"收到来自 {client_config.name} 的微信消息：userid={user_id}, text={content}")
+            elif msg_type == "image":
+                media_id = DomUtils.tag_value(root_node, "MediaId")
+                pic_url = DomUtils.tag_value(root_node, "PicUrl")
+                if media_id:
+                    images = [CommingMessage.MessageImage(ref=f"wxwork://media_id/{media_id}")]
+                elif pic_url:
+                    images = [CommingMessage.MessageImage(ref=pic_url)]
+                logger.info(
+                    f"收到来自 {client_config.name} 的微信图片消息：userid={user_id}, images={len(images) if images else 0}"
+                )
+            elif msg_type == "voice":
+                media_id = DomUtils.tag_value(root_node, "MediaId")
+                recognition = DomUtils.tag_value(root_node, "Recognition", default="")
+                content = (recognition or "").strip()
+                if media_id:
+                    audio_refs = [f"wxwork://voice_media_id/{media_id}"]
+                logger.info(
+                    f"收到来自 {client_config.name} 的微信语音消息：userid={user_id}, "
+                    f"text={content}, audios={len(audio_refs) if audio_refs else 0}"
+                )
+            elif msg_type == "file":
+                media_id = DomUtils.tag_value(root_node, "MediaId")
+                file_name = DomUtils.tag_value(root_node, "FileName")
+                if media_id:
+                    files = [
+                        CommingMessage.MessageAttachment(
+                            ref=f"wxwork://file_media_id/{media_id}",
+                            name=file_name,
+                        )
+                    ]
+                logger.info(
+                    f"收到来自 {client_config.name} 的微信文件消息：userid={user_id}, files={len(files) if files else 0}"
+                )
             else:
                 return None
 
-            if content:
+            if content and content.startswith("/") and self._should_reject_admin_command(
+                    client_config.config, user_id
+            ):
+                client.send_msg(title="只有管理员才有权限执行此命令", userid=user_id)
+                return None
+
+            if content or images or audio_refs or files:
                 # 处理消息内容
                 return CommingMessage(channel=MessageChannel.Wechat, source=client_config.name,
-                                      userid=user_id, username=user_id, text=content)
+                                      userid=user_id, username=user_id, text=content or "",
+                                      images=images, audio_refs=audio_refs, files=files)
         except Exception as err:
             logger.error(f"微信消息处理发生错误：{str(err)}")
         return None
 
-    def post_message(self, message: Notification) -> None:
+    def _parse_bot_message(self, source: str, body: Any, client_config) -> Optional[CommingMessage]:
+        try:
+            if isinstance(body, bytes):
+                msg_json = json.loads(body)
+            elif isinstance(body, dict):
+                msg_json = body
+            else:
+                msg_json = json.loads(body)
+            while isinstance(msg_json, str):
+                msg_json = json.loads(msg_json)
+        except Exception as err:
+            logger.debug(f"解析企业微信智能机器人消息失败：{err}")
+            return None
+
+        if not isinstance(msg_json, dict):
+            return None
+
+        payload_body = msg_json.get("body") or {}
+        sender = ((payload_body.get("from") or {}).get("userid") or "").strip()
+        if not sender:
+            return None
+        if payload_body.get("chattype") == "group":
+            return None
+
+        text = WeChatBot._extract_text_from_body(payload_body)
+        images = WeChatBot._extract_images_from_body(payload_body)
+        audio_refs = ["wxbot://voice"] if payload_body.get("msgtype") == "voice" else None
+        files = None
+        if payload_body.get("msgtype") == "file":
+            file_payload = payload_body.get("file") or {}
+            download_url = file_payload.get("download_url")
+            if download_url:
+                files = [
+                    CommingMessage.MessageAttachment(
+                        ref=f"wxbot://file/{quote(download_url, safe='')}",
+                        name=file_payload.get("name") or file_payload.get("filename"),
+                        mime_type=file_payload.get("content_type")
+                        or file_payload.get("mime_type"),
+                        size=file_payload.get("size"),
+                    )
+                ]
+        if text:
+            text = re.sub(r"@\S+", "", text).strip()
+
+        if text and text.startswith("/") and self._should_reject_admin_command(
+                client_config.config, sender
+        ):
+            client: WeChatBot = self.get_instance(client_config.name)
+            if client:
+                client.send_msg(title="只有管理员才有权限执行此命令", userid=sender)
+            return None
+
+        if not text and not images and not audio_refs and not files:
+            return None
+
+        logger.info(
+            f"收到来自 {client_config.name} 的企业微信智能机器人消息："
+            f"userid={sender}, text={text}, images={len(images) if images else 0}"
+        )
+        return CommingMessage(
+            channel=MessageChannel.Wechat,
+            source=client_config.name,
+            userid=sender,
+            username=sender,
+            text=text or "",
+            images=images,
+            audio_refs=audio_refs,
+            files=files,
+        )
+
+    def post_message(self, message: Notification, **kwargs) -> None:
         """
         发送消息
         :param message: 消息内容
@@ -202,8 +344,56 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
                     return
             client: WeChat = self.get_instance(conf.name)
             if client:
-                client.send_msg(title=message.title, text=message.text,
-                                image=message.image, userid=userid, link=message.link)
+                if message.voice_path and hasattr(client, "send_voice"):
+                    sent = client.send_voice(
+                        voice_path=message.voice_path,
+                        userid=userid,
+                    )
+                    if not sent:
+                        client.send_msg(title=message.title, text=message.text,
+                                        image=message.image, userid=userid, link=message.link)
+                else:
+                    client.send_msg(title=message.title, text=message.text,
+                                    image=message.image, userid=userid, link=message.link)
+
+    def download_wechat_image_to_data_url(self, image_ref: str, source: str) -> Optional[str]:
+        """
+        下载企业微信渠道图片并转换为 data URL
+        """
+        if not image_ref:
+            return None
+        client_config = self.get_config(source)
+        if not client_config:
+            return None
+        client = self.get_instance(client_config.name)
+        if not client:
+            return None
+        if image_ref.startswith("wxwork://media_id/") and hasattr(client, "download_media_to_data_url"):
+            media_id = image_ref.replace("wxwork://media_id/", "", 1)
+            return client.download_media_to_data_url(media_id)
+        if image_ref.startswith("wxbot://image/") and hasattr(client, "download_image_to_data_url"):
+            return client.download_image_to_data_url(image_ref)
+        return None
+
+    def download_wechat_media_bytes(self, media_ref: str, source: str) -> Optional[bytes]:
+        """
+        下载企业微信语音媒体并返回原始字节。
+        """
+        if not media_ref:
+            return None
+        client_config = self.get_config(source)
+        if not client_config:
+            return None
+        client = self.get_instance(client_config.name)
+        if not client or not hasattr(client, "download_media_bytes"):
+            return None
+        if media_ref.startswith("wxwork://voice_media_id/"):
+            media_id = media_ref.replace("wxwork://voice_media_id/", "", 1)
+            return client.download_media_bytes(media_id)
+        if media_ref.startswith("wxwork://file_media_id/"):
+            media_id = media_ref.replace("wxwork://file_media_id/", "", 1)
+            return client.download_media_bytes(media_id)
+        return None
 
     def post_medias_message(self, message: Notification, medias: List[MediaInfo]) -> None:
         """
@@ -243,6 +433,9 @@ class WechatModule(_ModuleBase, _MessageBase[WeChat]):
         :param commands: 命令字典
         """
         for client_config in self.get_configs().values():
+            if self._is_bot_mode(client_config.config):
+                logger.debug(f"{client_config.name} 为智能机器人模式，跳过传统菜单初始化")
+                continue
             # 如果没有配置消息解密相关参数，则也没有必要进行菜单初始化
             if not client_config.config.get("WECHAT_ENCODING_AESKEY") or not client_config.config.get("WECHAT_TOKEN"):
                 logger.debug(f"{client_config.name} 缺少消息解密参数，跳过后续菜单初始化")

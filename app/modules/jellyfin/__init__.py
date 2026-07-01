@@ -2,12 +2,12 @@ from typing import Any, Generator, List, Optional, Tuple, Union
 
 from app import schemas
 from app.core.context import MediaInfo
-from app.core.event import eventmanager, Event
+from app.core.event import eventmanager
 from app.log import logger
 from app.modules import _MediaServerBase, _ModuleBase
 from app.modules.jellyfin.jellyfin import Jellyfin
 from app.schemas import AuthCredentials, AuthInterceptCredentials
-from app.schemas.types import MediaType, ModuleType, ChainEventType, MediaServerType, SystemConfigKey, EventType
+from app.schemas.types import MediaType, ModuleType, ChainEventType, MediaServerType
 
 
 class JellyfinModule(_ModuleBase, _MediaServerBase[Jellyfin]):
@@ -18,20 +18,6 @@ class JellyfinModule(_ModuleBase, _MediaServerBase[Jellyfin]):
         """
         super().init_service(service_name=Jellyfin.__name__.lower(),
                              service_type=lambda conf: Jellyfin(**conf.config, sync_libraries=conf.sync_libraries))
-
-    @eventmanager.register(EventType.ConfigChanged)
-    def handle_config_changed(self, event: Event):
-        """
-        处理配置变更事件
-        :param event: 事件对象
-        """
-        if not event:
-            return
-        event_data: schemas.ConfigChangeEventData = event.event_data
-        if event_data.key not in [SystemConfigKey.MediaServers.value]:
-            return
-        logger.info("配置变更，重新初始化Jellyfin模块...")
-        self.init_module()
 
     @staticmethod
     def get_name() -> str:
@@ -254,6 +240,19 @@ class JellyfinModule(_ModuleBase, _MediaServerBase[Jellyfin]):
         server_obj: Jellyfin = self.get_instance(server)
         if server_obj:
             return server_obj.get_items(library_id, start_index, limit)
+        return None
+
+    def mediaserver_items_count(self, server: str, library_id: Union[str, int]) -> Optional[int]:
+        """
+        获取指定媒体库可同步的媒体条目总数
+
+        :param server: 媒体服务器名称
+        :param library_id: 媒体库ID
+        :return: 媒体条目总数，查询失败时返回None
+        """
+        server_obj: Jellyfin = self.get_instance(server)
+        if server_obj:
+            return server_obj.get_items_count(library_id)
         return None
 
     def mediaserver_iteminfo(self, server: str, item_id: str) -> Optional[schemas.MediaServerItem]:

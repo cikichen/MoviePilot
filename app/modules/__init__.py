@@ -1,17 +1,25 @@
 from abc import abstractmethod, ABCMeta
 from typing import Generic, Tuple, Union, TypeVar, Type, Dict, Optional, Callable
+from pathlib import Path
 
 from app.helper.service import ServiceConfigHelper
 from app.schemas import Notification, NotificationConf, MediaServerConf, DownloaderConf
 from app.schemas.types import ModuleType, DownloaderType, MediaServerType, MessageChannel, StorageSchema, \
-    OtherModulesType
+    OtherModulesType, SystemConfigKey
+from app.utils.mixins import ConfigReloadMixin
 
 
-class _ModuleBase(metaclass=ABCMeta):
+class _ModuleBase(ConfigReloadMixin, metaclass=ABCMeta):
     """
     模块基类，实现对应方法，在有需要时会被自动调用，返回None代表不启用该模块，将继续执行下一模块
     输入参数与输出参数一致的，或没有输出的，可以被多个模块重复实现
     """
+
+    def on_config_changed(self):
+        self.init_module()
+
+    def get_reload_name(self):
+        return self.get_name()
 
     @abstractmethod
     def init_module(self) -> None:
@@ -177,6 +185,7 @@ class _MessageBase(ServiceBase[TService, NotificationConf]):
     """
     消息基类
     """
+    CONFIG_WATCH = {SystemConfigKey.Notifications.value}
 
     def __init__(self):
         """
@@ -224,6 +233,7 @@ class _DownloaderBase(ServiceBase[TService, DownloaderConf]):
     """
     下载器基类
     """
+    CONFIG_WATCH = {SystemConfigKey.Downloaders.value}
 
     def __init__(self):
         """
@@ -231,6 +241,19 @@ class _DownloaderBase(ServiceBase[TService, DownloaderConf]):
         """
         super().__init__()
         self._default_config_name: Optional[str] = None
+
+    def init_service(self, service_name: str,
+                     service_type: Optional[Union[Type[TService], Callable[..., TService]]] = None):
+        """
+        初始化服务，获取配置并实例化对应服务
+
+        :param service_name: 服务名称，作为配置匹配的依据
+        :param service_type: 服务的类型，可以是类类型（Type[TService]）、工厂函数（Callable）或 None 来跳过实例化
+        """
+        # 重置默认配置名称
+        self.reset_default_config_name()
+        # 初始化服务
+        super().init_service(service_name, service_type)
 
     def get_default_config_name(self) -> Optional[str]:
         """
@@ -263,11 +286,85 @@ class _DownloaderBase(ServiceBase[TService, DownloaderConf]):
             return {}
         return {conf.name: conf for conf in configs if conf.type == self._service_name and conf.enabled}
 
+    def reset_default_config_name(self):
+        """
+        重置默认配置名称
+        """
+        self._default_config_name = None
+
+    @staticmethod
+    def __replace_path_prefix(path: Union[Path, str], source: str, target: str) -> Optional[str]:
+        """
+        按完整路径段替换路径前缀，避免 /media 误匹配 /media2 这类相邻目录。
+        """
+        if not source or not source.strip() or not target or not target.strip():
+            return None
+
+        path_text = Path(path).as_posix()
+        source_path = Path(source.strip()).as_posix()
+        target_path = Path(target.strip()).as_posix()
+        if path_text == source_path:
+            return target_path
+
+        source_prefix = f"{source_path.rstrip('/')}/"
+        if path_text.startswith(source_prefix):
+            suffix = path_text[len(source_prefix):]
+            return (Path(target_path) / suffix).as_posix()
+        return None
+
+    @staticmethod
+    def __strip_storage_prefix(path: str) -> str:
+        """
+        去掉存储协议前缀 if any，下载器无法识别本地存储协议。
+        """
+        for s in StorageSchema:
+            prefix = f"{s.value}:"
+            if path.startswith(prefix):
+                return path[len(prefix):]
+        return path
+
+    def normalize_path(self, path: Path, downloader: Optional[str]) -> str:
+        """
+        根据下载器配置和路径映射，规范化下载路径
+
+        :param path: 存储路径
+        :param downloader: 下载器名称
+        :return: 规范化后发送给下载器的路径
+        """
+        normalized_path = path.as_posix()
+        conf = self.get_config(downloader)
+        if conf and conf.path_mapping:
+            for (storage_path, download_path) in conf.path_mapping:
+                mapped_path = self.__replace_path_prefix(normalized_path, storage_path, download_path)
+                if mapped_path:
+                    normalized_path = mapped_path
+                    break
+        return self.__strip_storage_prefix(normalized_path)
+
+    def normalize_return_path(self, path: Path, downloader: Optional[str]) -> str:
+        """
+        将下载器返回的路径反向映射为 MoviePilot 可访问的存储路径。
+
+        :param path: 下载器返回的路径
+        :param downloader: 下载器名称
+        :return: MoviePilot 可访问的路径
+        """
+        normalized_path = path.as_posix()
+        conf = self.get_config(downloader)
+        if conf and conf.path_mapping:
+            for (storage_path, download_path) in conf.path_mapping:
+                mapped_path = self.__replace_path_prefix(normalized_path, download_path, storage_path)
+                if mapped_path:
+                    normalized_path = mapped_path
+                    break
+        return self.__strip_storage_prefix(normalized_path)
+
 
 class _MediaServerBase(ServiceBase[TService, MediaServerConf]):
     """
     媒体服务器基类
     """
+    CONFIG_WATCH = {SystemConfigKey.MediaServers.value}
 
     def get_configs(self) -> Dict[str, MediaServerConf]:
         """

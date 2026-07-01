@@ -2,7 +2,9 @@ import gzip
 import json
 from typing import Annotated, Callable, Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response
+import aiofiles
+from anyio import Path as AsyncPath
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Request, Response
 from fastapi.responses import PlainTextResponse
 from fastapi.routing import APIRoute
 
@@ -13,18 +15,16 @@ from app.utils.crypto import CryptoJsUtils, HashUtils
 
 
 class GzipRequest(Request):
-
     async def body(self) -> bytes:
         if not hasattr(self, "_body"):
             body = await super().body()
             if "gzip" in self.headers.getlist("Content-Encoding"):
                 body = gzip.decompress(body)
-            self._body = body # noqa
+            self._body = body  # noqa
         return self._body
 
 
 class GzipRoute(APIRoute):
-
     def get_route_handler(self) -> Callable:
         original_route_handler = super().get_route_handler()
 
@@ -44,18 +44,20 @@ async def verify_server_enabled():
     return True
 
 
-cookie_router = APIRouter(route_class=GzipRoute,
-                          tags=["servcookie"],
-                          dependencies=[Depends(verify_server_enabled)])
+cookie_router = APIRouter(
+    route_class=GzipRoute,
+    tags=["servcookie"],
+    dependencies=[Depends(verify_server_enabled)],
+)
 
 
 @cookie_router.get("/", response_class=PlainTextResponse)
-def get_root():
+async def get_root():
     return "Hello MoviePilot! COOKIECLOUD API ROOT = /cookiecloud"
 
 
 @cookie_router.post("/", response_class=PlainTextResponse)
-def post_root():
+async def post_root():
     return "Hello MoviePilot! COOKIECLOUD API ROOT = /cookiecloud"
 
 
@@ -64,37 +66,38 @@ async def update_cookie(req: schemas.CookieData):
     """
     上传Cookie数据
     """
-    file_path = settings.COOKIE_PATH / f"{req.uuid}.json"
+    file_path = AsyncPath(settings.COOKIE_PATH) / f"{req.uuid}.json"
     content = json.dumps({"encrypted": req.encrypted})
-    with open(file_path, encoding="utf-8", mode="w") as file:
-        file.write(content)
-    with open(file_path, encoding="utf-8", mode="r") as file:
-        read_content = file.read()
+    async with aiofiles.open(file_path, encoding="utf-8", mode="w") as file:
+        await file.write(content)
+    async with aiofiles.open(file_path, encoding="utf-8", errors="replace", mode="r") as file:
+        read_content = await file.read()
     if read_content == content:
         return {"action": "done"}
     else:
         return {"action": "error"}
 
 
-def load_encrypt_data(uuid: str) -> Dict[str, Any]:
+async def load_encrypt_data(uuid: str) -> Dict[str, Any]:
     """
     加载本地加密原始数据
     """
-    file_path = settings.COOKIE_PATH / f"{uuid}.json"
+    file_path = AsyncPath(settings.COOKIE_PATH) / f"{uuid}.json"
 
     # 检查文件是否存在
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Item not found")
 
     # 读取文件
-    with open(file_path, encoding="utf-8", mode="r") as file:
-        read_content = file.read()
+    async with aiofiles.open(file_path, encoding="utf-8", errors="replace", mode="r") as file:
+        read_content = await file.read()
     data = json.loads(read_content.encode("utf-8"))
     return data
 
 
-def get_decrypted_cookie_data(uuid: str, password: str,
-                              encrypted: str) -> Optional[Dict[str, Any]]:
+def get_decrypted_cookie_data(
+    uuid: str, password: str, encrypted: str
+) -> Optional[Dict[str, Any]]:
     """
     加载本地加密数据并解密为Cookie
     """
@@ -116,19 +119,24 @@ def get_decrypted_cookie_data(uuid: str, password: str,
 
 @cookie_router.get("/get/{uuid}")
 async def get_cookie(
-        uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")]):
+    uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")],
+):
     """
     GET 下载加密数据
     """
-    return load_encrypt_data(uuid)
+    return await load_encrypt_data(uuid)
 
 
 @cookie_router.post("/get/{uuid}")
 async def post_cookie(
-        uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")],
-        request: schemas.CookiePassword):
+    uuid: Annotated[str, Path(min_length=5, pattern="^[a-zA-Z0-9]+$")],
+    request: Optional[schemas.CookiePassword] = Body(None),
+):
     """
     POST 下载加密数据
     """
-    data = load_encrypt_data(uuid)
-    return get_decrypted_cookie_data(uuid, request.password, data["encrypted"])
+    data = await load_encrypt_data(uuid)
+    if request is not None:
+        return get_decrypted_cookie_data(uuid, request.password, data["encrypted"])
+    else:
+        return data

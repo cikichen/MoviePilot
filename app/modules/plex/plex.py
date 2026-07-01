@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Tuple, Generator, Any, Union
 from urllib.parse import quote_plus
 
-from plexapi import media
+from plexapi.exceptions import NotFound
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
 from requests import Response, Session
@@ -152,9 +152,11 @@ class Plex:
                     name=library.title,
                     path=library.locations,
                     type=library_type,
+                    item_count=self.get_items_count(library.key),
                     image_list=image_list,
                     link=f"{self._playhost or self._host}web/index.html#!/media/{self._plex.machineIdentifier}"
-                         f"/com.plexapp.plugins.library?source={library.key}"
+                         f"/com.plexapp.plugins.library?source={library.key}&X-Plex-Token={self._token}",
+                    server_type='plex'
                 )
             )
         return libraries
@@ -169,9 +171,9 @@ class Plex:
         sections = self._plex.library.sections()
         movie_count = tv_count = episode_count = 0
         # 媒体库白名单
-        allow_library = [lib.id for lib in self.get_librarys(hidden=True)]
+        allow_library = [str(lib.id) for lib in self.get_librarys(hidden=True)]
         for sec in sections:
-            if sec.key not in allow_library:
+            if str(sec.key) not in allow_library:
                 continue
             if sec.type == "movie":
                 movie_count += sec.totalSize
@@ -260,20 +262,18 @@ class Plex:
         if not self._plex:
             return None, {}
         if item_id:
-            videos = self.__fetch_item(item_id)
+            try:
+                videos = self.__fetch_item(item_id)
+            except NotFound:
+                # Plex删除并重新入库后metadata id会变化，缓存的旧item_id失效时回退到搜索路径。
+                logger.warning(f"Plex缓存的电视剧媒体ID {item_id} 已失效，尝试按标题重新搜索：{title}")
+                videos = self.__search_show(title=title,
+                                            original_title=original_title,
+                                            year=year)
         else:
-            # 兼容年份为空的场景
-            kwargs = {"year": year} if year else {}
-            # 根据标题和年份模糊搜索，该结果不够准确
-            videos = self._plex.library.search(title=title,
-                                               libtype="show",
-                                               **kwargs)
-            if (not videos
-                    and original_title
-                    and str(original_title) != str(title)):
-                videos = self._plex.library.search(title=original_title,
-                                                   libtype="show",
-                                                   **kwargs)
+            videos = self.__search_show(title=title,
+                                        original_title=original_title,
+                                        year=year)
 
         if not videos:
             return None, {}
@@ -286,12 +286,37 @@ class Plex:
         episodes = videos.episodes()
         season_episodes = {}
         for episode in episodes:
-            if season and episode.seasonNumber != int(season):
+            if season is not None and episode.seasonNumber != int(season):
                 continue
             if episode.seasonNumber not in season_episodes:
                 season_episodes[episode.seasonNumber] = []
             season_episodes[episode.seasonNumber].append(episode.index)
         return videos.key, season_episodes
+
+    def __search_show(self,
+                      title: Optional[str] = None,
+                      original_title: Optional[str] = None,
+                      year: Optional[str] = None) -> Any:
+        """
+        按标题搜索Plex电视剧条目，供常规查询和缓存item_id失效后的回退查询复用。
+        :param title: 标题
+        :param original_title: 原产地标题
+        :param year: 年份，可以为空，为空时不按年份过滤
+        :return: Plex搜索返回的电视剧条目列表
+        """
+        # 兼容年份为空的场景
+        kwargs = {"year": year} if year else {}
+        # 根据标题和年份模糊搜索，该结果不够准确，后续仍会通过tmdb_id校验。
+        videos = self._plex.library.search(title=title,
+                                           libtype="show",
+                                           **kwargs)
+        if (not videos
+                and original_title
+                and str(original_title) != str(title)):
+            videos = self._plex.library.search(title=original_title,
+                                               libtype="show",
+                                               **kwargs)
+        return videos
 
     def get_remote_image_by_id(self,
                                item_id: str,
@@ -314,50 +339,85 @@ class Plex:
             item = self._plex.fetchItem(ekey=ekey)
             if not item:
                 return None
+            # 直接使用当前条目的 art/thumb 作为 Plex 本地图片兜底。
+            # 这样既能兼容 webhook 返回带 /children 的 key，也能避免图片列表为空时彻底没有封面。
+            local_image_url = self.__build_local_image_url(item=item,
+                                                           image_type=image_type,
+                                                           plex_url=plex_url)
             # 如果配置了外网播放地址以及Token，则默认从Plex媒体服务器获取图片，否则返回有外网地址的图片资源
             # Plex外网播放地址这个框里目前可以填两种地址
             #   1. Plex的官方转发地址https://app.plex.tv, 2. 自己处理的端口转发地址
             #   如果使用的是1的官方转发地址,那么就不能走这个逻辑，因为官方转发地址无法获取到图片
             if (self._playhost and "app.plex.tv" not in self._playhost
                     and self._token and plex_url):
-                query = {"X-Plex-Token": self._token}
-                if image_type == "Poster":
-                    if item.thumb:
-                        image_url = UrlUtils.combine_url(host=self._playhost, path=item.thumb, query=query)
-                else:
-                    # 默认使用art也就是Backdrop进行处理
-                    if item.art:
-                        image_url = UrlUtils.combine_url(host=self._playhost, path=item.art, query=query)
-                    # 这里对episode进行特殊处理，实际上episode的Backdrop是Poster
-                    # 也有个别情况，比如机智的凡人小子episode就是Poster，因此这里把episode的优先级降低，默认还是取art
-                    if not image_url and item.TYPE == "episode" and item.thumb:
-                        image_url = UrlUtils.combine_url(host=self._playhost, path=item.thumb, query=query)
+                image_url = local_image_url
             else:
                 if image_type == "Poster":
-                    images = self._plex.fetchItems(ekey=f"{ekey}/posters",
-                                                   cls=media.Poster)
+                    # 这里必须通过 item.posters() 走 Plex 的规范 metadata endpoint，
+                    # 不能直接拼原始 item_id，否则 show webhook 返回 /children 时会变成 /children/posters。
+                    images = item.posters() if hasattr(item, "posters") else []
+                    images = images or []
                 else:
                     # 默认使用art也就是Backdrop进行处理
-                    images = self._plex.fetchItems(ekey=f"{ekey}/arts",
-                                                   cls=media.Art)
+                    # 同上，统一通过 item.arts() 取图片列表，避免 /children/arts 这类错误路径。
+                    images = item.arts() if hasattr(item, "arts") else []
+                    images = images or []
                     # 这里对episode进行特殊处理，实际上episode的Backdrop是Poster
                     # 也有个别情况，比如机智的凡人小子episode就是Poster，因此这里把episode的优先级降低，默认还是取art
                     if not images and item.TYPE == "episode":
-                        images = self._plex.fetchItems(ekey=f"{ekey}/posters",
-                                                       cls=media.Poster)
+                        images = item.posters() if hasattr(item, "posters") else []
+                        images = images or []
                 for image in images:
-                    if hasattr(image, "key") and image.key.startswith("http"):
-                        image_url = image.key
+                    image_key = getattr(image, "key", None)
+                    if image_key and image_key.startswith("http"):
+                        image_url = image_key
                         break
-                    # 如果最后还是找不到，则递归父级进行查找
-                if not image_url and hasattr(item, "parentKey"):
-                    return self.get_remote_image_by_id(item_id=item.parentKey,
+                # 某些 Plex 条目没有可直接外链的图片列表，此时退回到当前条目的实际图片地址。
+                if not image_url and local_image_url:
+                    image_url = local_image_url
+                # 如果最后还是找不到，则递归父级进行查找
+                parent_key = getattr(item, "parentKey", None)
+                if not image_url and parent_key:
+                    return self.get_remote_image_by_id(item_id=parent_key,
                                                        image_type=image_type,
-                                                       depth=depth + 1)
+                                                       depth=depth + 1,
+                                                       plex_url=plex_url)
             return image_url
         except Exception as e:
             logger.error(f"获取封面出错：" + str(e))
         return None
+
+    def __build_local_image_url(
+            self,
+            item: Any,
+            image_type: str,
+            plex_url: Optional[bool] = True
+    ) -> Optional[str]:
+        """
+        构造 Plex 本地图片地址，作为图片列表查询失败时的兜底结果。
+        """
+        if not item or not plex_url or not self._token:
+            return None
+
+        # app.plex.tv 无法直接用于图片获取，因此回退到实际的 Plex 服务地址。
+        image_host = self._playhost if self._playhost and "app.plex.tv" not in self._playhost else self._host
+        if not image_host:
+            return None
+
+        query = {"X-Plex-Token": self._token}
+        item_type = getattr(item, "TYPE", None)
+
+        if image_type == "Poster":
+            image_path = getattr(item, "thumb", None)
+        else:
+            image_path = getattr(item, "art", None)
+            # episode 的背景图经常落在 thumb 上，这里沿用原有特殊处理逻辑。
+            if not image_path and item_type == "episode":
+                image_path = getattr(item, "thumb", None)
+
+        if not image_path:
+            return None
+        return UrlUtils.combine_url(host=image_host, path=image_path, query=query)
 
     def refresh_root_library(self) -> bool:
         """
@@ -378,7 +438,10 @@ class Plex:
             file_path = item.target_path
             lib_key, path = self.__find_librarie(file_path, self._libraries)
             # 如果存在同一剧集的多集,key(path)相同会合并
-            result_dict[path] = lib_key
+            if path:
+                result_dict[path.as_posix()] = lib_key
+            else:
+                result_dict[""] = lib_key
         if "" in result_dict:
             # 如果有匹配失败的,刷新整个库
             self._plex.library.update()
@@ -386,10 +449,12 @@ class Plex:
             # 否则一个一个刷新
             for path, lib_key in result_dict.items():
                 logger.info(f"刷新媒体库：{lib_key} - {path}")
-                self._plex.query(f'/library/sections/{lib_key}/refresh?path={quote_plus(str(Path(path).parent))}')
+                self._plex.query(f'/library/sections/{lib_key}/refresh?path={quote_plus(Path(path).parent.as_posix())}')
+                return None
+        return None
 
     @staticmethod
-    def __find_librarie(path: Path, libraries: List[Any]) -> Tuple[str, str]:
+    def __find_librarie(path: Path, libraries: List[Any]) -> Tuple[str, Optional[Path]]:
         """
         判断这个path属于哪个媒体库
         多个媒体库配置的目录不应有重复和嵌套,
@@ -404,17 +469,17 @@ class Plex:
             return _path.parts[:len(_parent.parts)] == _parent.parts
 
         if path is None:
-            return "", ""
+            return "", None
 
         try:
             for lib in libraries:
                 if hasattr(lib, "locations") and lib.locations:
                     for location in lib.locations:
                         if is_subpath(path, Path(location)):
-                            return lib.key, str(path)
+                            return lib.key, path
         except Exception as err:
             logger.error(f"查找媒体库出错：{str(err)}")
-        return "", ""
+        return "", None
 
     def get_iteminfo(self, itemid: str) -> Optional[schemas.MediaServerItem]:
         """
@@ -431,7 +496,7 @@ class Plex:
 
     @staticmethod
     def __get_ids(guids: List[Any]) -> dict:
-        def parse_tmdb_id(value: str) -> (bool, int):
+        def parse_tmdb_id(value: str) -> tuple[bool, int]:
             """尝试将TMDB ID字符串转换为整数。如果成功，返回(True, int)，失败则返回(False, None)。"""
             try:
                 int_value = int(value)
@@ -511,6 +576,22 @@ class Plex:
             user_state=user_state,
         )
 
+    def get_items_count(self, parent: Union[str, int]) -> Optional[int]:
+        """
+        获取指定媒体库可同步的媒体条目总数
+
+        :param parent: 媒体库ID
+        :return: 媒体条目总数，查询失败时返回None
+        """
+        if not parent or not self._plex:
+            return None
+        try:
+            section = self._plex.library.sectionByID(int(parent))
+            return int(section.totalSize) if section else None
+        except Exception as err:
+            logger.error(f"查询媒体库 {parent} 的媒体总数出错：{str(err)}")
+            return None
+
     def get_items(self, parent: Union[str, int], start_index: Optional[int] = 0, limit: Optional[int] = -1) \
             -> Generator[MediaServerItem | None, Any, None]:
         """
@@ -541,8 +622,9 @@ class Plex:
                         continue
         except Exception as err:
             logger.error(f"获取媒体库列表出错：{str(err)}")
+        return None
 
-    def get_webhook_message(self, form: any) -> Optional[schemas.WebhookEventInfo]:
+    def get_webhook_message(self, form: Any) -> Optional[schemas.WebhookEventInfo]:
         """
         解析Plex报文
         eventItem  字段的含义
@@ -718,7 +800,7 @@ class Plex:
         拼装媒体播放链接
         :param item_id: 媒体的的ID
         """
-        return f'{self._playhost or self._host}web/index.html#!/server/{self._plex.machineIdentifier}/details?key={item_id}'
+        return f'{self._playhost or self._host}web/index.html#!/server/{self._plex.machineIdentifier}/details?key={item_id}&X-Plex-Token={self._token}'
 
     def get_resume(self, num: Optional[int] = 12) -> Optional[List[schemas.MediaServerPlayItem]]:
         """
@@ -739,7 +821,7 @@ class Plex:
             item_type = MediaType.MOVIE.value if item.TYPE == "movie" else MediaType.TV.value
             if item_type == MediaType.MOVIE.value:
                 title = item.title
-                subtitle = item.year
+                subtitle = str(item.year) if item.year else None
             else:
                 title = item.grandparentTitle
                 subtitle = f"S{item.parentIndex}:E{item.index} - {item.title}"
@@ -752,7 +834,8 @@ class Plex:
                 type=item_type,
                 image=image,
                 link=link,
-                percent=item.viewOffset / item.duration * 100 if item.viewOffset and item.duration else 0
+                percent=item.viewOffset / item.duration * 100 if item.viewOffset and item.duration else 0,
+                server_type='plex'
             ))
         return ret_resume[:num]
 
@@ -788,7 +871,7 @@ class Plex:
 
             # 合并排序
             for hub in hubs:
-                for item in hub.items:
+                for item in hub.items():
                     sub_result.append(item)
             sub_result.sort(key=lambda x: x.addedAt, reverse=True)
 
@@ -817,10 +900,11 @@ class Plex:
                 ret_resume.append(schemas.MediaServerPlayItem(
                     id=item.key,
                     title=title,
-                    subtitle=item.year,
+                    subtitle=str(item.year) if item.year else None,
                     type=item_type,
                     image=image,
-                    link=link
+                    link=link,
+                    server_type='plex'
                 ))
             offset += num
         return ret_resume[:num]

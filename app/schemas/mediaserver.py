@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Optional, Dict, Union, List, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from app.schemas.types import MediaType
 
@@ -14,7 +14,7 @@ class ExistMediaInfo(BaseModel):
     type: Optional[MediaType] = None
     # 季
     seasons: Optional[Dict[int, list]] = Field(default_factory=dict)
-    # 媒体服务器类型：plex、jellyfin、emby、trimemedia
+    # 媒体服务器类型：plex、jellyfin、emby、zspace、trimemedia、ugreen
     server_type: Optional[str] = None
     # 媒体服务器名称
     server: Optional[str] = None
@@ -34,6 +34,8 @@ class NotExistMediaInfo(BaseModel):
     total_episode: Optional[int] = 0
     # 开始集
     start_episode: Optional[int] = 0
+    # 候选资源须完整覆盖目标范围
+    require_complete_coverage: Optional[bool] = False
 
 
 class RefreshMediaItem(BaseModel):
@@ -43,7 +45,7 @@ class RefreshMediaItem(BaseModel):
     # 标题
     title: Optional[str] = None
     # 年份
-    year: Optional[str] = None
+    year: Optional[Union[str, int]] = None
     # 类型
     type: Optional[MediaType] = None
     # 类别
@@ -60,18 +62,28 @@ class MediaServerLibrary(BaseModel):
     server: Optional[str] = None
     # ID
     id: Optional[Union[str, int]] = None
+    # 媒体服务器项目ID
+    item_id: Optional[Union[str, int]] = None
+    # 媒体服务器ID
+    server_id: Optional[str] = None
     # 名称
     name: Optional[str] = None
     # 路径
     path: Optional[Union[str, list]] = None
     # 类型
     type: Optional[str] = None
+    # 媒体库内媒体数量
+    item_count: Optional[int] = None
     # 封面图
     image: Optional[str] = None
     # 封面图列表
     image_list: Optional[List[str]] = None
     # 跳转链接
     link: Optional[str] = None
+    # 服务器类型
+    server_type: Optional[str] = None
+    # 飞牛的图片需要Cookies
+    use_cookies: Optional[bool] = None
 
 
 class MediaServerItemUserState(BaseModel):
@@ -97,6 +109,8 @@ class MediaServerItem(BaseModel):
     server: Optional[str] = None
     # 媒体库ID
     library: Optional[Union[str, int]] = None
+    # 媒体服务器ID
+    server_id: Optional[str] = None
     # ID
     item_id: Optional[str] = None
     # 类型
@@ -106,7 +120,7 @@ class MediaServerItem(BaseModel):
     # 原标题
     original_title: Optional[str] = None
     # 年份
-    year: Optional[str] = None
+    year: Optional[Union[str, int]] = None
     # TMDBID
     tmdbid: Optional[int] = None
     # IMDBID
@@ -123,8 +137,7 @@ class MediaServerItem(BaseModel):
     lst_mod_date: Optional[str] = None
     user_state: Optional[MediaServerItemUserState] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MediaServerSeasonInfo(BaseModel):
@@ -168,6 +181,8 @@ class MediaServerPlayItem(BaseModel):
     媒体服务器可播放项目信息
     """
     id: Optional[Union[str, int]] = None
+    item_id: Optional[Union[str, int]] = None
+    server_id: Optional[str] = None
     title: Optional[str] = None
     subtitle: Optional[str] = None
     type: Optional[str] = None
@@ -175,3 +190,6 @@ class MediaServerPlayItem(BaseModel):
     link: Optional[str] = None
     percent: Optional[float] = None
     BackdropImageTags: Optional[list] = Field(default_factory=list)
+    server_type: Optional[str] = None
+    # 飞牛的图片需要Cookies
+    use_cookies: Optional[bool] = None

@@ -1,7 +1,10 @@
 import json
 import re
 import threading
+import base64
+import subprocess
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, List, Dict
 
 from app.core.context import MediaInfo, Context
@@ -13,6 +16,10 @@ from app.utils.string import StringUtils
 from app.utils.url import UrlUtils
 
 lock = threading.Lock()
+
+
+class RetryException(Exception):
+    pass
 
 
 class WeChat:
@@ -39,6 +46,10 @@ class WeChat:
     _create_menu_url = "cgi-bin/menu/create?access_token={access_token}&agentid={agentid}"
     # 企业微信删除菜单URL
     _delete_menu_url = "cgi-bin/menu/delete?access_token={access_token}&agentid={agentid}"
+    # 企业微信下载媒体URL
+    _download_media_url = "cgi-bin/media/get?access_token={access_token}&media_id={media_id}"
+    # 企业微信上传临时素材URL
+    _upload_media_url = "cgi-bin/media/upload?access_token={access_token}&type={media_type}"
 
     def __init__(self, WECHAT_CORPID: Optional[str] = None, WECHAT_APP_SECRET: Optional[str] = None,
                  WECHAT_APP_ID: Optional[str] = None, WECHAT_PROXY: Optional[str] = None, **kwargs):
@@ -58,6 +69,8 @@ class WeChat:
             self._token_url = UrlUtils.adapt_request_url(self._proxy, self._token_url)
             self._create_menu_url = UrlUtils.adapt_request_url(self._proxy, self._create_menu_url)
             self._delete_menu_url = UrlUtils.adapt_request_url(self._proxy, self._delete_menu_url)
+            self._download_media_url = UrlUtils.adapt_request_url(self._proxy, self._download_media_url)
+            self._upload_media_url = UrlUtils.adapt_request_url(self._proxy, self._upload_media_url)
 
         if self._corpid and self._appsecret and self._appid:
             self.__get_access_token()
@@ -68,7 +81,7 @@ class WeChat:
         """
         return True if self.__get_access_token() else False
 
-    @retry(Exception, logger=logger)
+    @retry(RetryException, logger=logger)
     def __get_access_token(self, force=False):
         """
         获取微信Token
@@ -84,23 +97,19 @@ class WeChat:
         if not token_flag or force:
             if not self._corpid or not self._appsecret:
                 return None
-            try:
-                token_url = self._token_url.format(corpid=self._corpid, corpsecret=self._appsecret)
-                res = RequestUtils().get_res(token_url)
-                if res:
-                    ret_json = res.json()
-                    if ret_json.get("errcode") == 0:
-                        self._access_token = ret_json.get("access_token")
-                        self._expires_in = ret_json.get("expires_in")
-                        self._access_token_time = datetime.now()
-                elif res is not None:
-                    logger.error(f"获取微信access_token失败，错误码：{res.status_code}，错误原因：{res.reason}")
-                else:
-                    logger.error(f"获取微信access_token失败，未获取到返回信息")
-                    raise Exception("获取微信access_token失败，网络连接失败")
-            except Exception as e:
-                logger.error(f"获取微信access_token失败，错误信息：{str(e)}")
-                return None
+            token_url = self._token_url.format(corpid=self._corpid, corpsecret=self._appsecret)
+            res = RequestUtils().get_res(token_url)
+            if res:
+                ret_json = res.json()
+                if ret_json.get("errcode") == 0:
+                    self._access_token = ret_json.get("access_token")
+                    self._expires_in = ret_json.get("expires_in")
+                    self._access_token_time = datetime.now()
+            elif res is not None:
+                logger.error(f"获取微信access_token失败，错误码：{res.status_code}，错误原因：{res.reason}")
+            else:
+                logger.error(f"获取微信access_token失败，未获取到返回信息")
+                raise RetryException("获取微信access_token失败，重试中...")
         return self._access_token
 
     @staticmethod
@@ -169,8 +178,8 @@ class WeChat:
         :param link: 跳转链接
         :return: 发送状态，错误信息
         """
-        if not title:
-            logger.error("消息标题不能为空")
+        if not title and not text:
+            logger.error("消息标题和内容不能都为空")
             return False
         if text:
             formatted_text = text.replace("\n\n", "\n")
@@ -267,6 +276,225 @@ class WeChat:
             logger.error(f"发送消息失败：{e}")
             return False
 
+    @staticmethod
+    def _guess_mime_type(content: bytes, default: str = "image/jpeg") -> str:
+        """
+        根据文件头推断图片 MIME
+        """
+        if not content:
+            return default
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if content.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if content.startswith(b"BM"):
+            return "image/bmp"
+        if content.startswith(b"RIFF") and b"WEBP" in content[:16]:
+            return "image/webp"
+        return default
+
+    def download_media_to_data_url(self, media_id: str) -> Optional[str]:
+        """
+        下载企业微信媒体文件并转换为 data URL
+        """
+        if not media_id:
+            return None
+        access_token = self.__get_access_token()
+        if not access_token:
+            logger.error("下载企业微信媒体失败：access_token 获取失败")
+            return None
+        req_url = self._download_media_url.format(
+            access_token=access_token,
+            media_id=media_id,
+        )
+        try:
+            res = RequestUtils(timeout=30).get_res(req_url)
+        except Exception as err:
+            logger.error(f"下载企业微信媒体失败：{err}")
+            return None
+        if not res or not res.content:
+            return None
+
+        content_type = (res.headers.get("Content-Type") or "").split(";")[0].strip()
+        if content_type == "application/json":
+            try:
+                logger.error(f"企业微信媒体下载失败：{res.json()}")
+            except Exception:
+                logger.error(f"企业微信媒体下载失败：{res.text}")
+            return None
+
+        mime_type = self._guess_mime_type(res.content, content_type or "image/jpeg")
+        return f"data:{mime_type};base64,{base64.b64encode(res.content).decode()}"
+
+    def download_media_bytes(self, media_id: str) -> Optional[bytes]:
+        """
+        下载企业微信媒体文件并返回原始字节。
+        """
+        if not media_id:
+            return None
+        access_token = self.__get_access_token()
+        if not access_token:
+            logger.error("下载企业微信媒体失败：access_token 获取失败")
+            return None
+        req_url = self._download_media_url.format(
+            access_token=access_token,
+            media_id=media_id,
+        )
+        try:
+            res = RequestUtils(timeout=30).get_res(req_url)
+        except Exception as err:
+            logger.error(f"下载企业微信媒体失败：{err}")
+            return None
+        if not res or not res.content:
+            return None
+        content_type = (res.headers.get("Content-Type") or "").split(";")[0].strip()
+        if content_type == "application/json":
+            try:
+                logger.error(f"企业微信媒体下载失败：{res.json()}")
+            except Exception:
+                logger.error(f"企业微信媒体下载失败：{res.text}")
+            return None
+        return res.content
+
+    @staticmethod
+    def _convert_voice_to_amr(voice_path: str) -> Optional[Path]:
+        """
+        将语音文件转换为企业微信要求的 AMR 格式（<=60s）。
+        """
+        src_path = Path(voice_path)
+        if not src_path.exists():
+            logger.error(f"语音文件不存在：{src_path}")
+            return None
+
+        dst_path = src_path.with_suffix(".amr")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src_path),
+            "-ar",
+            "8000",
+            "-ac",
+            "1",
+            "-t",
+            "60",
+            str(dst_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as err:
+            logger.error(f"调用 ffmpeg 转换 AMR 失败：{err}")
+            return None
+
+        if result.returncode != 0 or not dst_path.exists():
+            logger.error(
+                "ffmpeg 转换 AMR 失败: returncode=%s, stderr=%s",
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+            )
+            return None
+
+        if dst_path.stat().st_size > 2 * 1024 * 1024:
+            logger.error("AMR 语音文件超过 2MB，无法发送到企业微信")
+            dst_path.unlink(missing_ok=True)
+            return None
+        return dst_path
+
+    def _upload_temp_media(self, media_path: Path, media_type: str = "voice") -> Optional[str]:
+        """
+        上传企业微信临时素材，返回 media_id。
+        """
+        access_token = self.__get_access_token()
+        if not access_token:
+            return None
+        req_url = self._upload_media_url.format(
+            access_token=access_token,
+            media_type=media_type,
+        )
+        try:
+            # Read file content into memory to avoid file handle issues
+            with media_path.open("rb") as media_file:
+                file_content = media_file.read()
+
+            # Use RequestUtils with Accept header to avoid Content-Type conflicts
+            response = RequestUtils(timeout=60).request(
+                method="post",
+                url=req_url,
+                headers={"Accept": "application/json"},
+                files={
+                    "media": (
+                        media_path.name,
+                        file_content,
+                        "voice/amr" if media_type == "voice" else "application/octet-stream",
+                    )
+                },
+            )
+        except Exception as err:
+            logger.error(f"上传企业微信临时素材失败：{err}")
+            return None
+
+        if not response:
+            return None
+
+        try:
+            ret_json = response.json()
+        except Exception as err:
+            logger.error(f"解析企业微信临时素材响应失败：{err}")
+            return None
+
+        if ret_json.get("errcode") != 0:
+            logger.error(f"上传企业微信临时素材失败：{ret_json}")
+            return None
+        return ret_json.get("media_id")
+
+    def send_voice(self, voice_path: str, userid: Optional[str] = None) -> Optional[bool]:
+        """
+        发送企业微信语音消息。仅自建应用模式支持。
+        """
+        if not voice_path:
+            return False
+        if not self.__get_access_token():
+            logger.error("获取微信access_token失败，请检查参数配置")
+            return None
+        if not userid:
+            userid = "@all"
+
+        source_path = Path(voice_path)
+        converted_path = self._convert_voice_to_amr(voice_path)
+        if not converted_path:
+            return False
+
+        try:
+            media_id = self._upload_temp_media(converted_path, media_type="voice")
+            if not media_id:
+                return False
+
+            req_json = {
+                "touser": userid,
+                "msgtype": "voice",
+                "agentid": self._appid,
+                "voice": {
+                    "media_id": media_id
+                },
+                "safe": 0,
+                "enable_id_trans": 0,
+                "enable_duplicate_check": 0
+            }
+            return self.__post_request(self._send_msg_url, req_json)
+        except Exception as err:
+            logger.error(f"发送企业微信语音消息失败：{err}")
+            return False
+        finally:
+            converted_path.unlink(missing_ok=True)
+            source_path.unlink(missing_ok=True)
+
     def send_medias_msg(self, medias: List[MediaInfo], userid: Optional[str] = None) -> Optional[bool]:
         """
         发送列表类消息
@@ -307,7 +535,8 @@ class WeChat:
             return False
 
     def send_torrents_msg(self, torrents: List[Context],
-                          userid: Optional[str] = None, title: Optional[str] = None, link: Optional[str] = None) -> Optional[bool]:
+                          userid: Optional[str] = None, title: Optional[str] = None,
+                          link: Optional[str] = None) -> Optional[bool]:
         """
         发送列表消息
         """
@@ -359,7 +588,7 @@ class WeChat:
             logger.error(f"发送消息失败：{e}")
             return False
 
-    @retry(Exception, logger=logger)
+    @retry(RetryException, logger=logger)
     def __post_request(self, url: str, req_json: dict) -> bool:
         """
         向微信发送请求
@@ -384,7 +613,7 @@ class WeChat:
                 self.__get_access_token(force=True)
                 error_msg = (f"access_token 已过期，尝试重新获取 access_token,"
                              f"errcode: {ret_json.get('errcode')}, errmsg: {ret_json.get('errmsg')}")
-                raise Exception(error_msg)
+                raise RetryException(error_msg)
             else:
                 logger.error(f"发送请求失败，错误信息：{ret_json.get('errmsg')}")
                 return False
@@ -464,7 +693,6 @@ class WeChat:
                 })
         except Exception as e:
             logger.error(f"创建菜单失败：{e}")
-            return False
 
     def delete_menus(self):
         """
@@ -477,4 +705,3 @@ class WeChat:
             RequestUtils().get(req_url)
         except Exception as e:
             logger.error(f"删除菜单失败：{e}")
-            return False

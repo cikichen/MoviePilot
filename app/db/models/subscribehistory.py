@@ -1,16 +1,17 @@
 from typing import Optional
 
-from sqlalchemy import Column, Integer, String, Sequence, Float, JSON
+from sqlalchemy import Column, Integer, String, Float, JSON, Index, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from app.db import db_query, Base
+from app.db import db_query, Base, get_id_column, async_db_query
 
 
 class SubscribeHistory(Base):
     """
     订阅历史表
     """
-    id = Column(Integer, Sequence('id'), primary_key=True, index=True)
+    id = get_id_column()
     # 标题
     name = Column(String, nullable=False, index=True)
     # 年份
@@ -59,6 +60,10 @@ class SubscribeHistory(Base):
     sites = Column(JSON)
     # 是否洗版
     best_version = Column(Integer, default=0)
+    # 是否只洗全集整包，开启后电视剧洗版不按单集下载
+    best_version_full = Column(Integer, default=0)
+    # 洗版时已下载剧集的优先级状态，格式：{"1": 90, "2": 100}
+    episode_priority = Column(JSON)
     # 保存路径
     save_path = Column(String)
     # 是否使用 imdbid 搜索
@@ -72,23 +77,61 @@ class SubscribeHistory(Base):
     # 剧集组
     episode_group = Column(String)
 
-    @staticmethod
+    __table_args__ = (
+        Index('ix_subscribehistory_type_date', 'type', 'date'),
+    )
+
+    @classmethod
     @db_query
-    def list_by_type(db: Session, mtype: str, page: Optional[int] = 1, count: Optional[int] = 30):
-        return db.query(SubscribeHistory).filter(
-            SubscribeHistory.type == mtype
+    def list_by_type(cls, db: Session, mtype: str, page: Optional[int] = 1, count: Optional[int] = 30):
+        return db.query(cls).filter(
+            cls.type == mtype
         ).order_by(
-            SubscribeHistory.date.desc()
+            cls.date.desc()
         ).offset((page - 1) * count).limit(count).all()
 
-    @staticmethod
+    @classmethod
+    @async_db_query
+    async def async_list_by_type(cls, db: AsyncSession, mtype: str, page: Optional[int] = 1, count: Optional[int] = 30):
+        result = await db.execute(
+            select(cls).filter(
+                cls.type == mtype
+            ).order_by(
+                cls.date.desc()
+            ).offset((page - 1) * count).limit(count)
+        )
+        return result.scalars().all()
+
+    @classmethod
     @db_query
-    def exists(db: Session, tmdbid: Optional[int] = None, doubanid: Optional[str] = None, season: Optional[int] = None):
+    def exists(cls, db: Session, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
+               season: Optional[int] = None):
         if tmdbid:
-            if season:
-                return db.query(SubscribeHistory).filter(SubscribeHistory.tmdbid == tmdbid,
-                                                         SubscribeHistory.season == season).first()
-            return db.query(SubscribeHistory).filter(SubscribeHistory.tmdbid == tmdbid).first()
+            if season is not None:
+                return db.query(cls).filter(cls.tmdbid == tmdbid,
+                                            cls.season == season).first()
+            return db.query(cls).filter(cls.tmdbid == tmdbid).first()
         elif doubanid:
-            return db.query(SubscribeHistory).filter(SubscribeHistory.doubanid == doubanid).first()
+            return db.query(cls).filter(cls.doubanid == doubanid).first()
         return None
+
+    @classmethod
+    @async_db_query
+    async def async_exists(cls, db: AsyncSession, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
+                           season: Optional[int] = None):
+        if tmdbid:
+            if season is not None:
+                result = await db.execute(
+                    select(cls).filter(cls.tmdbid == tmdbid, cls.season == season)
+                )
+            else:
+                result = await db.execute(
+                    select(cls).filter(cls.tmdbid == tmdbid)
+                )
+        elif doubanid:
+            result = await db.execute(
+                select(cls).filter(cls.doubanid == doubanid)
+            )
+        else:
+            return None
+        return result.scalars().first()

@@ -13,6 +13,7 @@ from app.helper.cloudflare import under_challenge
 from app.log import logger
 from app.utils.http import RequestUtils
 from app.utils.site import SiteUtils
+from app.utils.string import StringUtils
 
 
 # 站点框架
@@ -33,6 +34,9 @@ class SiteSchema(Enum):
     MTorrent = "MTorrent"
     Yema = "Yema"
     HDDolby = "HDDolby"
+    Zhixing = "Zhixing"
+    Bitpt = "Bitpt"
+    RousiPro = "RousiPro"
 
 
 class SiteParserBase(metaclass=ABCMeta):
@@ -150,6 +154,13 @@ class SiteParserBase(metaclass=ABCMeta):
         :return: 站点解析模型
         """
         return self.schema
+
+    @staticmethod
+    def num_filesize(text) -> int:
+        """
+        将站点页面中的文件大小文本转换为字节。
+        """
+        return StringUtils.num_filesize(text)
 
     def parse(self):
         """
@@ -352,7 +363,11 @@ class SiteParserBase(metaclass=ABCMeta):
                                headers=req_headers).get_res(url=url)
         if res is not None and res.status_code in (200, 500, 403):
             if req_headers and "application/json" in str(req_headers.get("Accept")):
-                return json.dumps(res.json())
+                try:
+                    return json.dumps(res.json())
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.error(f"{self._site_name} API响应JSON解析失败: {e}")
+                    return ""
             else:
                 # 如果cloudflare 有防护，尝试使用浏览器仿真
                 if under_challenge(res.text):

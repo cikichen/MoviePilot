@@ -1,31 +1,33 @@
 import sys
 
-from app.core.cache import close_cache
-from app.core.config import settings
-from app.core.module import ModuleManager
-from app.log import logger
-from app.utils.system import SystemUtils
-from app.command import CommandChain
+from app.helper.redis import RedisHelper, AsyncRedisHelper
 
 # SitesHelper涉及资源包拉取，提前引入并容错提示
 try:
-    from app.helper.sites import SitesHelper
+    from app.helper.sites import SitesHelper  # noqa
 except ImportError as e:
     SitesHelper = None
     error_message = f"错误: {str(e)}\n站点认证及索引相关资源导入失败，请尝试重建容器或手动拉取资源"
     print(error_message, file=sys.stderr)
     sys.exit(1)
 
+from app.utils.system import SystemUtils
+from app.log import logger
+from app.core.config import settings
+from app.core.module import ModuleManager
 from app.core.event import EventManager
 from app.helper.thread import ThreadHelper
 from app.helper.display import DisplayHelper
 from app.helper.doh import DohHelper
 from app.helper.resource import ResourceHelper
-from app.helper.message import MessageHelper
-from app.schemas import Notification, NotificationType
-from app.schemas.types import SystemConfigKey
+from app.helper.message import MessageHelper, stop_message
+from app.helper.server import MoviePilotServerHelper
 from app.db import close_database
 from app.db.systemconfig_oper import SystemConfigOper
+from app.command import CommandChain
+from app.schemas import Notification, NotificationType
+from app.schemas.types import SystemConfigKey
+from app.startup.agent_initializer import init_agent, stop_agent
 
 
 def start_frontend():
@@ -68,9 +70,27 @@ def clear_temp():
     清理临时文件和图片缓存
     """
     # 清理临时目录中3天前的文件
-    SystemUtils.clear(settings.TEMP_PATH, days=3)
+    SystemUtils.clear(settings.TEMP_PATH, days=settings.TEMP_FILE_DAYS)
     # 清理图片缓存目录中7天前的文件
-    SystemUtils.clear(settings.CACHE_PATH / "images", days=7)
+    SystemUtils.clear(settings.CACHE_PATH / "images", days=settings.GLOBAL_IMAGE_CACHE_DAYS)
+    # 清理 pip/uv 包下载缓存，不接管整个 .cache 目录。
+    clear_package_tool_cache()
+
+
+def clear_package_tool_cache():
+    """
+    清理 pip/uv 包下载缓存，只处理 MoviePilot 管理的工具子目录。
+    """
+    days = settings.PACKAGE_CACHE_DAYS
+    if days <= 0:
+        return
+    tool_cache_root = settings.PACKAGE_CACHE_PATH
+    for child in ("pip", "uv"):
+        cache_path = tool_cache_root / child
+        try:
+            SystemUtils.clear(cache_path, days=days)
+        except Exception as err:
+            logger.warning("清理包下载缓存失败：%s - %s", cache_path, err)
 
 
 def user_auth():
@@ -105,10 +125,12 @@ def check_auth():
         )
 
 
-def stop_modules():
+async def stop_modules():
     """
     服务关闭
     """
+    # 停止AI智能体
+    await stop_agent()
     # 停止模块
     ModuleManager().stop()
     # 停止事件消费
@@ -117,10 +139,13 @@ def stop_modules():
     DisplayHelper().stop()
     # 停止线程池
     ThreadHelper().shutdown()
-    # 停止缓存连接
-    close_cache()
+    # 停止消息服务
+    stop_message()
+    # 关闭Redis缓存连接
+    RedisHelper().close()
+    await AsyncRedisHelper().close()
     # 停止数据库连接
-    close_database()
+    await close_database()
     # 停止前端服务
     stop_frontend()
     # 清理临时文件
@@ -145,6 +170,13 @@ def init_modules():
     ModuleManager()
     # 启动事件消费
     EventManager().start()
+    # 初始化共享服务端状态
+    MoviePilotServerHelper.init_plugin_report()
+    MoviePilotServerHelper.init_subscribe_report()
+    MoviePilotServerHelper.get_user_uuid()
+    MoviePilotServerHelper.get_github_user()
+    # 初始化AI智能体
+    init_agent()
     # 启动前端服务
     start_frontend()
     # 检查认证状态

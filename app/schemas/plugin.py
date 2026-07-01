@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel, Field
 
@@ -36,6 +36,14 @@ class Plugin(BaseModel):
     has_page: Optional[bool] = False
     # 是否有新版本
     has_update: Optional[bool] = False
+    # 主系统版本是否兼容
+    system_version_compatible: Optional[bool] = True
+    # 主系统版本兼容提示
+    system_version_message: Optional[str] = None
+    # 主系统版本限定范围
+    system_version: Optional[str] = None
+    # 是否声明支持通过 GitHub Release 资产安装
+    release: Optional[bool] = False
     # 是否本地
     is_local: Optional[bool] = False
     # 仓库地址
@@ -67,3 +75,35 @@ class PluginDashboard(Plugin):
     cols: Optional[dict] = Field(default_factory=dict)
     # 页面元素
     elements: Optional[List[dict]] = Field(default_factory=list)
+
+
+class PluginSidebarNavItem(BaseModel):
+    """
+    插件侧栏导航项（前端全页路由）
+    """
+    plugin_id: str = Field(description="插件 ID")
+    nav_key: str = Field(description="导航键，对应 URL 段")
+    title: str = Field(description="侧栏标题")
+    icon: str = Field(default="mdi-puzzle", description="MDI 图标名")
+    section: str = Field(
+        description="分组：start / discovery / subscribe / organize / system",
+    )
+    permission: Optional[str] = Field(
+        default=None,
+        description="权限：subscribe / discovery / search / manage / admin",
+    )
+    order: int = Field(default=0, description="同组内排序，越小越靠前")
+
+
+class PluginMemoryInfo(BaseModel):
+    """插件内存信息"""
+    plugin_id: str = Field(description="插件ID")
+    plugin_name: str = Field(description="插件名称")
+    plugin_version: str = Field(description="插件版本")
+    total_memory_bytes: int = Field(description="总内存使用量(字节)")
+    total_memory_mb: float = Field(description="总内存使用量(MB)")
+    object_count: int = Field(description="对象数量")
+    calculation_time_ms: float = Field(description="计算耗时(毫秒)")
+    timestamp: float = Field(description="统计时间戳")
+    error: Optional[str] = Field(default=None, description="错误信息")
+    object_details: Optional[List[Dict[str, Any]]] = Field(default=None, description="大对象详情")

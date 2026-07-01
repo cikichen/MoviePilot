@@ -1,6 +1,6 @@
 from typing import Optional, Any, Union, Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class Site(BaseModel):
@@ -47,8 +47,7 @@ class Site(BaseModel):
     # 下载器
     downloader: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SiteStatistic(BaseModel):
@@ -67,8 +66,7 @@ class SiteStatistic(BaseModel):
     # 备注
     note: Optional[Any] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SiteUserData(BaseModel):
@@ -77,7 +75,7 @@ class SiteUserData(BaseModel):
     # 用户名
     username: Optional[str] = None
     # 用户ID
-    userid: Optional[Union[int, str]] = None
+    userid: Optional[Union[str, int]] = None
     # 用户等级
     user_level: Optional[str] = None
     # 加入时间
@@ -115,6 +113,15 @@ class SiteUserData(BaseModel):
 class SiteAuth(BaseModel):
     site: Optional[str] = None
     params: Optional[Dict[str, Union[int, str]]] = Field(default_factory=dict)
+
+
+class SiteCookieUpdate(BaseModel):
+    """
+    站点 Cookie 与 UA 更新请求。
+    """
+    username: str = Field(..., description="站点登录用户名")
+    password: str = Field(..., description="站点登录密码")
+    code: Optional[str] = Field(None, description="二步验证码或密钥")
 
 
 class SiteCategory(BaseModel):

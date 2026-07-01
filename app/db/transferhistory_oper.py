@@ -20,6 +20,57 @@ class TransferHistoryOper(DbOper):
         """
         return TransferHistory.get(self._db, historyid)
 
+    async def async_get(self, historyid: int) -> TransferHistory:
+        """
+        异步获取转移历史。
+        """
+        return await TransferHistory.async_get(self._db, historyid)
+
+    async def async_list_by_title(
+        self,
+        title: str,
+        page: Optional[int] = 1,
+        count: Optional[int] = 30,
+        status: Optional[bool] = None,
+    ) -> List[TransferHistory]:
+        """
+        异步按标题分页查询转移记录。
+        """
+        return await TransferHistory.async_list_by_title(
+            self._db, title=title, page=page, count=count, status=status
+        )
+
+    async def async_list_by_page(
+        self,
+        page: Optional[int] = 1,
+        count: Optional[int] = 30,
+        status: Optional[bool] = None,
+    ) -> List[TransferHistory]:
+        """
+        异步分页查询转移记录。
+        """
+        return await TransferHistory.async_list_by_page(
+            self._db, page=page, count=count, status=status
+        )
+
+    async def async_count(self, status: Optional[bool] = None) -> int:
+        """
+        异步统计转移记录数量。
+        """
+        return await TransferHistory.async_count(self._db, status=status)
+
+    async def async_count_by_title(
+        self,
+        title: str,
+        status: Optional[bool] = None,
+    ) -> int:
+        """
+        异步按标题统计转移记录数量。
+        """
+        return await TransferHistory.async_count_by_title(
+            self._db, title=title, status=status
+        )
+
     def get_by_title(self, title: str) -> List[TransferHistory]:
         """
         按标题查询转移记录
@@ -93,6 +144,12 @@ class TransferHistoryOper(DbOper):
         """
         TransferHistory.delete(self._db, historyid)
 
+    async def async_delete(self, historyid):
+        """
+        异步删除转移记录。
+        """
+        await TransferHistory.async_delete(self._db, historyid)
+
     def truncate(self):
         """
         清空转移记录
@@ -125,13 +182,13 @@ class TransferHistoryOper(DbOper):
         """
         新增转移成功历史记录
         """
-        self.add_force(
+        return self.add_force(
             src=fileitem.path,
             src_storage=fileitem.storage,
-            src_fileitem=fileitem.dict(),
+            src_fileitem=fileitem.model_dump(),
             dest=transferinfo.target_item.path if transferinfo.target_item else None,
             dest_storage=transferinfo.target_item.storage if transferinfo.target_item else None,
-            dest_fileitem=transferinfo.target_item.dict() if transferinfo.target_item else None,
+            dest_fileitem=transferinfo.target_item.model_dump() if transferinfo.target_item else None,
             mode=mode,
             type=mediainfo.type.value,
             category=mediainfo.category,
@@ -159,10 +216,10 @@ class TransferHistoryOper(DbOper):
             his = self.add_force(
                 src=fileitem.path,
                 src_storage=fileitem.storage,
-                src_fileitem=fileitem.dict(),
+                src_fileitem=fileitem.model_dump(),
                 dest=transferinfo.target_item.path if transferinfo.target_item else None,
                 dest_storage=transferinfo.target_item.storage if transferinfo.target_item else None,
-                dest_fileitem=transferinfo.target_item.dict() if transferinfo.target_item else None,
+                dest_fileitem=transferinfo.target_item.model_dump() if transferinfo.target_item else None,
                 mode=mode,
                 type=mediainfo.type.value,
                 category=mediainfo.category,
@@ -188,7 +245,7 @@ class TransferHistoryOper(DbOper):
                 year=meta.year,
                 src=fileitem.path,
                 src_storage=fileitem.storage,
-                src_fileitem=fileitem.dict(),
+                src_fileitem=fileitem.model_dump(),
                 mode=mode,
                 seasons=meta.season,
                 episodes=meta.episode,

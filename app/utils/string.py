@@ -23,6 +23,17 @@ _special_domains = [
 _version_map = {"stable": -1, "rc": -2, "beta": -3, "alpha": -4}
 # 不符合的版本号
 _other_version = -5
+_max_media_title_words = 10
+_min_media_title_length = 2
+_non_media_title_pattern = re.compile(r"^#|^请[问帮你]|[?？]$|^继续$")
+_chat_intent_pattern = re.compile(r"帮我|请问|怎么|如何|为什么|可以|能否|推荐|介绍|谢谢|想看|找一下|搜一下")
+_media_feature_pattern = re.compile(
+    r"第\s*[0-9一二三四五六七八九十百零]+\s*[季集]|S\d{1,2}(?:E\d{1,4})?|E\d{1,4}|(?:19|20)\d{2}",
+    re.IGNORECASE
+)
+_media_separator_pattern = re.compile(r"[\s\-_.:：·'\"()\[\]【】]+")
+_media_sentence_punctuation_pattern = re.compile(r"[，。！？!?,；;]")
+_media_title_char_pattern = re.compile(r"[\u4e00-\u9fffA-Za-z]")
 
 
 class StringUtils:
@@ -229,7 +240,7 @@ class StringUtils:
                 size = float(size)
                 d = [(1024 - 1, 'K'), (1024 ** 2 - 1, 'M'), (1024 ** 3 - 1, 'G'), (1024 ** 4 - 1, 'T')]
                 s = [x[0] for x in d]
-                index = bisect.bisect_left(s, size) - 1 # noqa
+                index = bisect.bisect_left(s, size) - 1  # noqa
                 if index == -1:
                     return str(size) + "B"
                 else:
@@ -241,6 +252,27 @@ class StringUtils:
             return size
         else:
             return size + "B"
+
+    @staticmethod
+    def format_size(size_bytes: int) -> str:
+        """
+        将字节转换为人类可读格式
+        """
+        if not size_bytes or size_bytes == 0:
+            return "0 B"
+
+        units = ["B", "KB", "MB", "GB", "TB", "PB"]
+        size = float(size_bytes)
+        unit_index = 0
+
+        while size >= 1024 and unit_index < len(units) - 1:
+            size /= 1024
+            unit_index += 1
+
+        # 保留两位小数
+        if unit_index == 0:
+            return f"{int(size)} {units[unit_index]}"
+        return f"{size:.2f} {units[unit_index]}"
 
     @staticmethod
     def url_equal(url1: str, url2: str) -> bool:
@@ -509,6 +541,31 @@ class StringUtils:
         english_count = len(english_words)
 
         return chinese_count + english_count
+
+    @staticmethod
+    def is_media_title_like(text: str) -> bool:
+        """
+        判断文本是否像影视剧名称
+        """
+        if not text:
+            return False
+        text = re.sub(r'\s+', ' ', text).strip()
+        if not text:
+            return False
+        if _non_media_title_pattern.search(text) \
+                or StringUtils.count_words(text) > _max_media_title_words:
+            return False
+        if "://" in text or text.startswith("magnet:?"):
+            return False
+        if _chat_intent_pattern.search(text):
+            return False
+        if _media_sentence_punctuation_pattern.search(text):
+            return False
+
+        # 先移除季/集/年份等媒体特征，再移除分隔符，只保留核心名称用于最终判定
+        candidate = _media_feature_pattern.sub("", text)
+        candidate = _media_separator_pattern.sub("", candidate)
+        return len(candidate) >= _min_media_title_length and _media_title_char_pattern.search(candidate) is not None
 
     @staticmethod
     def split_text(text: str, max_length: int) -> Generator:
@@ -925,3 +982,32 @@ class StringUtils:
         if re.match(r'^[a-zA-Z0-9.-]+(\.[a-zA-Z]{2,})?$', text):
             return True
         return False
+
+    @staticmethod
+    def is_magnet_link(content: Union[str, bytes]) -> bool:
+        """
+        判断内容是否为磁力链接
+        """
+        if not content:
+            return False
+        if isinstance(content, str) and content.startswith("magnet:"):
+            return True
+        if isinstance(content, bytes) and content.startswith(b"magnet:"):
+            return True
+        return False
+
+    @staticmethod
+    def natural_sort_key(text: str) -> List[Union[int, str]]:
+        """
+        自然排序
+        将字符串拆分为数字和非数字部分，数字部分转换为整数，非数字部分转换为小写字母
+        :param text: 要处理的字符串
+        :return 用于排序的数字和字符串列表
+        """
+        if text is None:
+            return []
+
+        if not isinstance(text, str):
+            text = str(text)
+
+        return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)', text)]

@@ -2,12 +2,12 @@ from typing import Any, Generator, List, Optional, Tuple, Union
 
 from app import schemas
 from app.core.context import MediaInfo
-from app.core.event import eventmanager, Event
+from app.core.event import eventmanager
 from app.log import logger
 from app.modules import _MediaServerBase, _ModuleBase
 from app.modules.trimemedia.trimemedia import TrimeMedia
 from app.schemas import AuthCredentials, AuthInterceptCredentials
-from app.schemas.types import ChainEventType, MediaServerType, MediaType, ModuleType, SystemConfigKey, EventType
+from app.schemas.types import ChainEventType, MediaServerType, MediaType, ModuleType
 
 
 class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
@@ -22,20 +22,6 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
                 **conf.config, sync_libraries=conf.sync_libraries
             ),
         )
-
-    @eventmanager.register(EventType.ConfigChanged)
-    def handle_config_changed(self, event: Event):
-        """
-        处理配置变更事件
-        :param event: 事件对象
-        """
-        if not event:
-            return
-        event_data: schemas.ConfigChangeEventData = event.event_data
-        if event_data.key not in [SystemConfigKey.MediaServers.value]:
-            return
-        logger.info("配置变更，重新加载飞牛影视模块...")
-        self.init_module()
 
     @staticmethod
     def get_name() -> str:
@@ -154,7 +140,7 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
         """
         source = args.get("source")
         if source:
-            server: TrimeMedia = self.get_instance(source)
+            server: Optional[TrimeMedia] = self.get_instance(source)
             if not server:
                 return None
             result = server.get_webhook_message(body)
@@ -247,7 +233,7 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
         媒体数量统计
         """
         if server:
-            server_obj: TrimeMedia = self.get_instance(server)
+            server_obj: Optional[TrimeMedia] = self.get_instance(server)
             if not server_obj:
                 return None
             servers = [server_obj]
@@ -268,7 +254,7 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
         """
         媒体库列表
         """
-        server_obj: TrimeMedia = self.get_instance(server)
+        server_obj: Optional[TrimeMedia] = self.get_instance(server)
         if server_obj:
             return server_obj.get_librarys(hidden=hidden)
         return None
@@ -290,9 +276,24 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
 
         :return: 返回一个生成器对象，用于逐步获取媒体服务器中的项目
         """
-        server_obj: TrimeMedia = self.get_instance(server)
+        server_obj: Optional[TrimeMedia] = self.get_instance(server)
         if server_obj:
             return server_obj.get_items(library_id, start_index, limit)
+        return None
+
+    def mediaserver_items_count(
+        self, server: str, library_id: Union[str, int]
+    ) -> Optional[int]:
+        """
+        获取指定媒体库可同步的媒体条目总数
+
+        :param server: 媒体服务器名称
+        :param library_id: 媒体库ID
+        :return: 媒体条目总数，查询失败时返回None
+        """
+        server_obj: Optional[TrimeMedia] = self.get_instance(server)
+        if server_obj:
+            return server_obj.get_items_count(library_id)
         return None
 
     def mediaserver_iteminfo(
@@ -301,7 +302,7 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
         """
         媒体库项目详情
         """
-        server_obj: TrimeMedia = self.get_instance(server)
+        server_obj: Optional[TrimeMedia] = self.get_instance(server)
         if server_obj:
             return server_obj.get_iteminfo(item_id)
         return None
@@ -312,7 +313,9 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
         """
         获取剧集信息
         """
-        server_obj: TrimeMedia = self.get_instance(server)
+        if not isinstance(item_id, str):
+            return None
+        server_obj: Optional[TrimeMedia] = self.get_instance(server)
         if not server_obj:
             return None
         _, seasoninfo = server_obj.get_tv_episodes(item_id=item_id)
@@ -329,10 +332,10 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
         """
         获取媒体服务器正在播放信息
         """
-        server_obj: TrimeMedia = self.get_instance(server)
+        server_obj: Optional[TrimeMedia] = self.get_instance(server)
         if not server_obj:
             return []
-        return server_obj.get_resume(num=count)
+        return server_obj.get_resume(num=count) or []
 
     def mediaserver_play_url(
         self, server: str, item_id: Union[str, int]
@@ -340,7 +343,9 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
         """
         获取媒体库播放地址
         """
-        server_obj: TrimeMedia = self.get_instance(server)
+        if not isinstance(item_id, str):
+            return None
+        server_obj: Optional[TrimeMedia] = self.get_instance(server)
         if not server_obj:
             return None
         return server_obj.get_play_url(item_id)
@@ -354,10 +359,10 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
         """
         获取媒体服务器最新入库条目
         """
-        server_obj: TrimeMedia = self.get_instance(server)
+        server_obj: Optional[TrimeMedia] = self.get_instance(server)
         if not server_obj:
             return []
-        return server_obj.get_latest(num=count)
+        return server_obj.get_latest(num=count) or []
 
     def mediaserver_latest_images(
         self,
@@ -374,7 +379,31 @@ class TrimeMediaModule(_ModuleBase, _MediaServerBase[TrimeMedia]):
         :param remote: True为外网链接, False为内网链接
         :return: 图片链接列表
         """
-        server_obj: TrimeMedia = self.get_instance(server)
+        server_obj: Optional[TrimeMedia] = self.get_instance(server)
         if not server_obj:
             return []
-        return server_obj.get_latest_backdrops(num=count, remote=remote)
+        return server_obj.get_latest_backdrops(num=count, remote=remote) or []
+
+    def mediaserver_image_cookies(
+        self,
+        server: Optional[str] = None,
+        image_url: Optional[str] = None,
+        **kwargs,
+    ) -> Optional[str | dict]:
+        """
+        获取飞牛影视服务器的图片Cookies
+
+        :param server: 媒体服务器名称
+        :param image_url: 图片网址
+        """
+        if not image_url:
+            return None
+        if server:
+            server_obj = self.get_instance(server)
+            if not server_obj:
+                return None
+            return server_obj.get_image_cookies(image_url)
+        else:
+            for server_obj in self.get_instances().values():
+                if cookies := server_obj.get_image_cookies(image_url):
+                    return cookies

@@ -20,6 +20,36 @@ function WARN() {
     echo -e "${WARN} ${1}"
 }
 
+# 设置虚拟环境路径（兼容群晖等系统必须这样配置）
+VENV_PATH="${VENV_PATH:-/opt/venv}"
+export PATH="${VENV_PATH}/bin:$PATH"
+
+CONFIG_DIR="${CONFIG_DIR:-/config}"
+
+function apply_package_cache_env() {
+    PACKAGE_CACHE_ROOT="${PACKAGE_CACHE_ROOT:-${CONFIG_DIR}/.cache}"
+    export PACKAGE_CACHE_ROOT
+    export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${PACKAGE_CACHE_ROOT}/pip}"
+    export UV_CACHE_DIR="${UV_CACHE_DIR:-${PACKAGE_CACHE_ROOT}/uv}"
+    mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
+}
+
+apply_package_cache_env
+
+PIP_ENV=()
+
+function set_package_proxy_env() {
+    PIP_ENV=()
+    if [[ -n "${PROXY_HOST}" ]]; then
+        PIP_ENV=(
+            "HTTP_PROXY=${PROXY_HOST}"
+            "HTTPS_PROXY=${PROXY_HOST}"
+            "http_proxy=${PROXY_HOST}"
+            "https_proxy=${PROXY_HOST}"
+        )
+    fi
+}
+
 # 下载及解压
 function download_and_unzip() {
     local retries=0
@@ -54,16 +84,40 @@ function install_backend_and_download_resources() {
         return 1
     fi
     INFO "后端程序下载成功"
-    INFO "→ 正在安装依赖..."
-    if ! pip install ${PIP_OPTIONS} --upgrade --root-user-action=ignore pip > /dev/null; then
-        ERROR "pip 更新失败，请重新拉取镜像"
-        return 1
+    
+    # 检查依赖是否有变化
+    INFO "→ 检查依赖变化..."
+    if [ -f "${TMP_PATH}/App/requirements.in" ]; then
+        if ! cmp -s /app/requirements.in "${TMP_PATH}/App/requirements.in"; then
+            INFO "检测到依赖变化，正在更新虚拟环境..."
+            # 备份当前requirements.txt
+            cp /app/requirements.txt /tmp/requirements.txt.backup
+            # 复制新的requirements.in
+            cp "${TMP_PATH}/App/requirements.in" /app/requirements.in
+            # 重新编译依赖
+            if ! env "${PIP_ENV[@]}" ${VENV_PATH}/bin/pip-compile /app/requirements.in -o /app/requirements.txt; then
+                ERROR "依赖编译失败，恢复原依赖"
+                cp /tmp/requirements.txt.backup /app/requirements.txt
+                return 1
+            fi
+            # 安装新依赖
+            if ! env "${PIP_ENV[@]}" ${VENV_PATH}/bin/pip install ${PIP_OPTIONS} -r /app/requirements.txt; then
+                ERROR "依赖安装失败，恢复原依赖"
+                cp /tmp/requirements.txt.backup /app/requirements.txt
+                return 1
+            fi
+            INFO "正在更新 CloakBrowser 浏览器内核"
+            if ! ${VENV_PATH}/bin/python -m cloakbrowser install; then
+                WARN "CloakBrowser 浏览器内核更新失败，后续首次使用时可能重新下载"
+            fi
+            INFO "依赖更新成功"
+        else
+            INFO "依赖无变化，跳过依赖更新"
+        fi
+    else
+        WARN "未找到requirements.in文件，跳过依赖检查"
     fi
-    if ! pip install ${PIP_OPTIONS} --root-user-action=ignore -r ${TMP_PATH}/App/requirements.txt > /dev/null; then
-        ERROR "依赖安装失败，请重新拉取镜像"
-        return 1
-    fi
-    INFO "依赖安装成功"
+    
     # 如果是"heads/v2.zip"，则查找v2开头的最新版本号
     if [[ "${1}" == "heads/v2.zip" ]]; then
         INFO "→ 正在获取前端最新版本号..."
@@ -103,7 +157,7 @@ function install_backend_and_download_resources() {
     INFO "→ 正在备份站点资源目录..."
     rm -rf /resources_bakcup
     mkdir /resources_bakcup
-    cp -a /app/app/helper/user.sites.bin /resources_bakcup
+    cp -a /app/app/helper/user.sites.v2.bin /resources_bakcup
     cp -a /app/app/helper/sites.cp* /resources_bakcup
     # 清空程序目录
     rm -rf /app
@@ -119,14 +173,24 @@ function install_backend_and_download_resources() {
     cp -a /plugins/* /app/app/plugins/
     # 更新站点资源
     INFO "→ 开始更新站点资源..."
-    if ! download_and_unzip "${GITHUB_PROXY}https://github.com/jxxghp/MoviePilot-Resources/archive/refs/heads/main.zip" "Resources"; then
-        cp -a /resources_bakcup/* /app/app/helper/
-        rm -rf /resources_bakcup
-        WARN "站点资源下载失败，继续使用旧的资源来启动..."
-        return 1
+    python_version=$(python3 -c 'import sys; print(f"cpython-{sys.version_info.major}{sys.version_info.minor}")')
+    arch=$(uname -m)
+    if [ "$arch" = "aarch64" ]; then
+        arch_suffix="aarch64-linux-gnu"
+    else
+        arch_suffix="x86_64-linux-gnu"
     fi
-    # 复制新站点资源
-    cp -a ${TMP_PATH}/Resources/resources.v2/* /app/app/helper/
+    INFO "当前 Python 版本：${python_version}，架构：${arch}"
+    # 下载 user.sites.v2.bin
+    if ! curl ${CURL_OPTIONS} "${GITHUB_PROXY}https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/user.sites.v2.bin" -o /app/app/helper/user.sites.v2.bin; then
+        cp -a /resources_bakcup/user.sites.v2.bin /app/app/helper/
+        WARN "user.sites.v2.bin 下载失败，继续使用旧的资源来启动..."
+    fi
+    # 下载对应平台的 sites 文件
+    sites_file="sites.${python_version}-${arch_suffix}.so"
+    if ! curl ${CURL_OPTIONS} "${GITHUB_PROXY}https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/${sites_file}" -o "/app/app/helper/${sites_file}"; then
+        WARN "${sites_file} 下载失败，继续使用旧的资源来启动..."
+    fi
     INFO "站点资源更新成功"
     # 清理临时目录
     rm -rf "${TMP_PATH}"
@@ -134,13 +198,20 @@ function install_backend_and_download_resources() {
 }
 
 function test_connectivity_pip() {
-    pip uninstall -y pip-hello-world > /dev/null 2>&1
+    ${VENV_PATH}/bin/pip uninstall -y pip-hello-world > /dev/null 2>&1
     case "$1" in
     0)
         if [[ -n "${PIP_PROXY}" ]]; then
-            if pip install -i ${PIP_PROXY} pip-hello-world > /dev/null 2>&1; then
+            if [[ -n "${PROXY_HOST}" ]]; then
+                HTTP_PROXY="${PROXY_HOST}" HTTPS_PROXY="${PROXY_HOST}" http_proxy="${PROXY_HOST}" https_proxy="${PROXY_HOST}" \
+                    ${VENV_PATH}/bin/pip install -i ${PIP_PROXY} pip-hello-world > /dev/null 2>&1
+            else
+                ${VENV_PATH}/bin/pip install -i ${PIP_PROXY} pip-hello-world > /dev/null 2>&1
+            fi
+            if [[ $? -eq 0 ]]; then
                 PIP_OPTIONS="-i ${PIP_PROXY}"
                 PIP_LOG="镜像代理模式"
+                set_package_proxy_env
                 return 0
             fi
         fi
@@ -148,15 +219,18 @@ function test_connectivity_pip() {
         ;;
     1)
         if [[ -n "${PROXY_HOST}" ]]; then
-            if pip install --proxy=${PROXY_HOST} pip-hello-world > /dev/null 2>&1; then
-                PIP_OPTIONS="--proxy=${PROXY_HOST}"
+            if HTTP_PROXY="${PROXY_HOST}" HTTPS_PROXY="${PROXY_HOST}" http_proxy="${PROXY_HOST}" https_proxy="${PROXY_HOST}" \
+                ${VENV_PATH}/bin/pip install pip-hello-world > /dev/null 2>&1; then
+                PIP_OPTIONS=""
                 PIP_LOG="全局代理模式"
+                set_package_proxy_env
                 return 0
             fi
         fi
         return 1
         ;;
     2)
+        PIP_ENV=()
         PIP_OPTIONS=""
         PIP_LOG="不使用代理"
         return 0

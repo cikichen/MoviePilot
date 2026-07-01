@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 
 from app.core.config import settings
 from app.core.meta import MetaBase
@@ -95,18 +95,20 @@ class TorrentInfo:
         if upload_volume_factor is None or download_volume_factor is None:
             return "未知"
         free_strs = {
-            "1.0 1.0": "普通",
-            "1.0 0.0": "免费",
-            "2.0 1.0": "2X",
-            "4.0 1.0": "4X",
-            "2.0 0.0": "2X免费",
-            "4.0 0.0": "4X免费",
-            "1.0 0.5": "50%",
-            "2.0 0.5": "2X 50%",
-            "1.0 0.7": "70%",
-            "1.0 0.3": "30%"
+            "1.00 1.00": "普通",
+            "1.00 0.00": "免费",
+            "2.00 1.00": "2X",
+            "4.00 1.00": "4X",
+            "2.00 0.00": "2X免费",
+            "4.00 0.00": "4X免费",
+            "1.00 0.50": "50%",
+            "2.00 0.50": "2X 50%",
+            "1.00 0.70": "70%",
+            "1.00 0.30": "30%",
+            "1.00 0.75": "75%",
+            "1.00 0.25": "25%"
         }
-        return free_strs.get('%.1f %.1f' % (upload_volume_factor, download_volume_factor), "未知")
+        return free_strs.get('%.2f %.2f' % (upload_volume_factor, download_volume_factor), "未知")
 
     @property
     def volume_factor(self):
@@ -149,7 +151,96 @@ class TorrentInfo:
 
 
 @dataclass
+class SubtitleInfo:
+    """
+    字幕搜索结果信息。
+    """
+
+    # 站点ID
+    site: int = None
+    # 站点名称
+    site_name: str = None
+    # 站点Cookie
+    site_cookie: str = None
+    # 站点UA
+    site_ua: str = None
+    # 站点是否使用代理
+    site_proxy: bool = False
+    # 站点优先级
+    site_order: int = 0
+    # 字幕标题
+    title: str = None
+    # 字幕描述
+    description: str = None
+    # 字幕下载链接
+    enclosure: str = None
+    # 详情页面
+    page_url: str = None
+    # 语言
+    language: str = None
+    # 语言图标
+    language_icon: str = None
+    # 字幕大小
+    size: float = 0.0
+    # 发布时间
+    pubdate: str = None
+    # 已过时间
+    date_elapsed: str = None
+    # 点击/下载次数
+    grabs: int = 0
+    # 上传者
+    uploader: str = None
+    # 举报页面
+    report_url: str = None
+    # 种子ID
+    torrent_id: str = None
+    # 字幕ID
+    subtitle_id: str = None
+    # 下载文件名
+    file_name: str = None
+
+    def __build_meta_info(self) -> Optional[dict]:
+        """
+        从字幕标题、文件名和描述中识别可展示的季集信息。
+        """
+        for title in (self.title, self.file_name, self.description):
+            if not title:
+                continue
+            try:
+                meta_dict = MetaInfo(title=title, subtitle=self.description).to_dict()
+            except Exception:
+                continue
+            if meta_dict.get("season_episode") or meta_dict.get("episode_list"):
+                return meta_dict
+        return None
+
+    def __setattr__(self, name: str, value: Any):
+        self.__dict__[name] = value
+
+    def from_dict(self, data: dict):
+        """
+        从字典中初始化。
+        """
+        for key, value in data.items():
+            setattr(self, key, value)
+
+    def to_dict(self):
+        """
+        返回字典。
+        """
+        dicts = vars(self).copy()
+        meta_info = self.__build_meta_info()
+        if meta_info:
+            dicts["meta_info"] = meta_info
+            dicts["season_episode"] = meta_info.get("season_episode")
+            dicts["episode_list"] = meta_info.get("episode_list")
+        return dicts
+
+
+@dataclass
 class MediaInfo:
+    # 内部标记：是否命中本地识别缓存，不参与序列化
+    recognize_cache_hit = False
     # 来源：themoviedb、douban、bangumi
     source: str = None
     # 类型 电影、电视剧
@@ -193,7 +284,7 @@ class MediaInfo:
     # LOGO
     logo_path: str = None
     # 评分
-    vote_average: float = 0.0
+    vote_average: float = None
     # 描述
     overview: str = None
     # 风格ID
@@ -237,9 +328,9 @@ class MediaInfo:
     # 流媒体平台
     networks: list = field(default_factory=list)
     # 集数
-    number_of_episodes: int = 0
+    number_of_episodes: int = None
     # 季数
-    number_of_seasons: int = 0
+    number_of_seasons: int = None
     # 原产国
     origin_country: list = field(default_factory=list)
     # 原名
@@ -250,14 +341,16 @@ class MediaInfo:
     production_countries: list = field(default_factory=list)
     # 语种
     spoken_languages: list = field(default_factory=list)
+    # 所有发行日期
+    release_dates: list = field(default_factory=list)
     # 状态
     status: str = None
     # 标签
     tagline: str = None
     # 评价数量
-    vote_count: int = 0
+    vote_count: int = None
     # 流行度
-    popularity: int = 0
+    popularity: float = None
     # 时长
     runtime: int = None
     # 下一集
@@ -303,21 +396,6 @@ class MediaInfo:
             setattr(self, key, value)
         if isinstance(self.type, str):
             self.type = MediaType(self.type)
-
-    def set_image(self, name: str, image: str):
-        """
-        设置图片地址
-        """
-        setattr(self, f"{name}_path", image)
-
-    def get_image(self, name: str):
-        """
-        获取图片地址
-        """
-        try:
-            return getattr(self, f"{name}_path")
-        except AttributeError:
-            return None
 
     def set_category(self, cat: str):
         """
@@ -433,6 +511,18 @@ class MediaInfo:
             if self.release_date:
                 # 年份
                 self.year = self.release_date[:4]
+            # 所有发行日期
+            self.release_dates = [
+                {
+                    "date": release_date.get("release_date"),
+                    "iso_code": result.get("iso_3166_1"),
+                    "note": release_date.get("note"),
+                    "type": release_date.get("type"),
+                }
+                for result in info.get("release_dates", {}).get("results", [])
+                for release_date in result.get("release_dates", [])
+                if release_date.get("release_date")
+            ]
         else:
             # 电视剧
             self.title = info.get('name')
@@ -449,7 +539,7 @@ class MediaInfo:
                 for seainfo in info.get('seasons'):
                     # 季
                     season = seainfo.get("season_number")
-                    if not season:
+                    if season is None:
                         continue
                     # 集
                     episode_count = seainfo.get("episode_count")
@@ -463,18 +553,27 @@ class MediaInfo:
                 self.episode_groups = info.pop("episode_groups").get("results") or []
 
         # 海报
-        if info.get('poster_path'):
-            self.poster_path = f"https://{settings.TMDB_IMAGE_DOMAIN}/t/p/original{info.get('poster_path')}"
+        if path := info.get('poster_path'):
+            self.poster_path = settings.TMDB_IMAGE_URL(path)
         # 背景
-        if info.get('backdrop_path'):
-            self.backdrop_path = f"https://{settings.TMDB_IMAGE_DOMAIN}/t/p/original{info.get('backdrop_path')}"
+        if path := info.get('backdrop_path'):
+            self.backdrop_path = settings.TMDB_IMAGE_URL(path)
         # 导演和演员
         self.directors, self.actors = __directors_actors(info)
         # 别名和译名
         self.names = info.get('names') or []
         # 剩余属性赋值
         for key, value in info.items():
-            if hasattr(self, key) and not getattr(self, key):
+            if not value:
+                continue
+            if not hasattr(self, key):
+                continue
+            current_value = getattr(self, key)
+            if current_value:
+                continue
+            if current_value is None:
+                setattr(self, key, value)
+            elif type(current_value) is type(value):
                 setattr(self, key, value)
 
     def set_douban_info(self, info: dict):
@@ -520,9 +619,9 @@ class MediaInfo:
         # 识别标题中的季
         meta = MetaInfo(info.get("title"))
         # 季
-        if not self.season:
+        if self.season is None:
             self.season = meta.begin_season
-            if self.season:
+            if self.season is not None:
                 self.type = MediaType.TV
             elif not self.type:
                 self.type = MediaType.MOVIE
@@ -582,13 +681,13 @@ class MediaInfo:
         # 剧集
         if self.type == MediaType.TV and not self.seasons:
             meta = MetaInfo(info.get("title"))
-            season = meta.begin_season or 1
+            season = meta.begin_season if meta.begin_season is not None else 1
             episodes_count = info.get("episodes_count")
             if episodes_count:
                 self.seasons[season] = list(range(1, episodes_count + 1))
         # 季年份
         if self.type == MediaType.TV and not self.season_years:
-            season = self.season or 1
+            season = self.season if self.season is not None else 1
             self.season_years = {
                 season: self.year
             }
@@ -606,7 +705,16 @@ class MediaInfo:
             self.production_countries = [{"id": country, "name": country} for country in info.get("countries") or []]
         # 剩余属性赋值
         for key, value in info.items():
+            if not value:
+                continue
             if not hasattr(self, key):
+                continue
+            current_value = getattr(self, key)
+            if current_value:
+                continue
+            if current_value is None:
+                setattr(self, key, value)
+            elif type(current_value) is type(value):
                 setattr(self, key, value)
 
     def set_bangumi_info(self, info: dict):
@@ -633,7 +741,7 @@ class MediaInfo:
         # 识别标题中的季
         meta = MetaInfo(self.title)
         # 季
-        if not self.season:
+        if self.season is None:
             self.season = meta.begin_season
         # 评分
         if not self.vote_average:
@@ -664,12 +772,15 @@ class MediaInfo:
             if infobox:
                 akas = [item.get("value") for item in infobox if item.get("key") == "别名"]
                 if akas:
-                    self.names = [aka.get("v") for aka in akas[0]]
+                    if isinstance(akas[0], list):
+                        self.names = [aka.get("v") if isinstance(aka, dict) else aka for aka in akas[0]]
+                    elif isinstance(akas[0], str):
+                        self.names = [akas[0]]
 
         # 剧集
         if self.type == MediaType.TV and not self.seasons:
             meta = MetaInfo(self.title)
-            season = meta.begin_season or 1
+            season = meta.begin_season if meta.begin_season is not None else 1
             episodes_count = info.get("total_episodes")
             if episodes_count:
                 self.seasons[season] = list(range(1, episodes_count + 1))
@@ -796,6 +907,20 @@ class Context:
     media_info: MediaInfo = None
     # 种子信息
     torrent_info: TorrentInfo = None
+    # 媒体识别失败次数
+    media_recognize_fail_count: int = 0
+    # 候选资源来源：rss、spider、search、unknown。
+    resource_source: str = "unknown"
+    # 候选匹配来源：tmdbid、doubanid、imdbid、title、plugin、unknown。
+    match_source: str = "unknown"
+    # 候选自身是否已经识别出有效媒体 ID。
+    candidate_recognized: bool = False
+    # 当前 media_info 是否为目标媒体回填，而不是候选自身识别结果。
+    media_info_is_target: bool = False
+    # 调用方对本候选允许下载的剧集集合，None 表示不限制，空集合表示拒绝交付任何集。
+    allowed_episodes: Optional[Set[int]] = None
+    # 下载层确认候选资源覆盖完整目标范围，供订阅事实写入判断整包资源。
+    confirmed_full_coverage: bool = False
 
     def to_dict(self):
         """
@@ -804,5 +929,13 @@ class Context:
         return {
             "meta_info": self.meta_info.to_dict() if self.meta_info else None,
             "torrent_info": self.torrent_info.to_dict() if self.torrent_info else None,
-            "media_info": self.media_info.to_dict() if self.media_info else None
+            "media_info": self.media_info.to_dict() if self.media_info else None,
+            "media_recognize_fail_count": self.media_recognize_fail_count,
+            "resource_source": self.resource_source,
+            "match_source": self.match_source,
+            "candidate_recognized": self.candidate_recognized,
+            "media_info_is_target": self.media_info_is_target,
+            # 保留 None / 空集 / 非空集 三态语义，避免下游误把"显式拒绝"当成"不限制"。
+            "allowed_episodes": sorted(self.allowed_episodes) if self.allowed_episodes is not None else None,
+            "confirmed_full_coverage": self.confirmed_full_coverage,
         }

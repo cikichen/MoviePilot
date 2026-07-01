@@ -1,56 +1,89 @@
 from enum import Enum
-from typing import Union, Dict, Optional
+from typing import Union, Optional
 
+from app.core.cache import TTLCache
 from app.schemas.types import ProgressKey
-from app.utils.singleton import Singleton
 
 
-class ProgressHelper(metaclass=Singleton):
-    _process_detail: Dict[str, dict] = {}
+class ProgressHelper:
+    """
+    处理进度辅助类
+    """
 
-    def __init__(self):
-        self._process_detail = {}
-
-    def init_config(self):
-        pass
-
-    def __reset(self, key: Union[ProgressKey, str]):
+    def __init__(self, key: Union[ProgressKey, str]) -> None:
         if isinstance(key, Enum):
             key = key.value
-        self._process_detail[key] = {
+        self._key = key
+        self._progress = TTLCache(region="progress", maxsize=1024, ttl=24 * 60 * 60)
+
+    def __reset(self) -> None:
+        """
+        重置进度
+        """
+        self._progress[self._key] = {
             "enable": False,
             "value": 0,
-            "text": "请稍候..."
+            "text": "请稍候...",
+            "data": {}
         }
 
-    def start(self, key: Union[ProgressKey, str]):
-        self.__reset(key)
-        if isinstance(key, Enum):
-            key = key.value
-        self._process_detail[key]['enable'] = True
-
-    def end(self, key: Union[ProgressKey, str]):
-        if isinstance(key, Enum):
-            key = key.value
-        if not self._process_detail.get(key):
+    def start(self) -> None:
+        """
+        开始进度
+        """
+        self.__reset()
+        current = self._progress.get(self._key)
+        if not current:
             return
-        self._process_detail[key] = {
-            "enable": False,
-            "value": 100,
-            "text": "正在处理..."
-        }
+        current['enable'] = True
+        self._progress[self._key] = current
 
-    def update(self, key: Union[ProgressKey, str], value: Union[float, int] = None, text: Optional[str] = None):
-        if isinstance(key, Enum):
-            key = key.value
-        if not self._process_detail.get(key, {}).get('enable'):
+    def end(
+            self,
+            text: Optional[str] = "",
+            data: Optional[dict] = None,
+            value: Optional[Union[float, int]] = 100,
+    ) -> None:
+        """
+        结束进度
+        """
+        current = self._progress.get(self._key)
+        if not current:
             return
-        if value:
-            self._process_detail[key]['value'] = value
-        if text:
-            self._process_detail[key]['text'] = text
+        if data is not None:
+            if not current.get('data'):
+                current['data'] = {}
+            current['data'].update(data)
+        current["enable"] = False
+        if value is not None:
+            current["value"] = max(min(float(value), 100), 0)
+        current["text"] = text or ""
+        self._progress[self._key] = current
 
-    def get(self, key: Union[ProgressKey, str]) -> dict:
-        if isinstance(key, Enum):
-            key = key.value
-        return self._process_detail.get(key)
+    def update(
+            self,
+            value: Optional[Union[float, int]] = None,
+            text: Optional[str] = None,
+            data: Optional[dict] = None,
+    ) -> None:
+        """
+        更新进度
+        """
+        current = self._progress.get(self._key)
+        if not current or not current.get('enable'):
+            return
+        if value is not None:
+            current['value'] = max(min(float(value), 100), 0)
+        if text is not None:
+            current['text'] = text
+        if data is not None:
+            if not current.get('data'):
+                current['data'] = {}
+            current['data'].update(data)
+        self._progress[self._key] = current
+
+    def get(self) -> Optional[dict]:
+        """
+        获取当前进度
+        """
+        return self._progress.get(self._key)
