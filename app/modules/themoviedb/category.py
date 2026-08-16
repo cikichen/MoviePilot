@@ -7,19 +7,34 @@ from ruamel.yaml import CommentedMap
 
 from app.core.config import settings
 from app.log import logger
-from app.utils.singleton import Singleton
+from app.schemas.category import CategoryConfig
+from app.utils.singleton import WeakSingleton
+
+HEADER_COMMENTS = """####### 配置说明 #######
+# 1. 该配置文件用于配置电影和电视剧的分类策略，配置后程序会按照配置的分类策略名称进行分类，配置文件采用yaml格式，需要严格符合语法规则
+# 2. 配置文件中的一级分类名称：`movie`、`tv` 为固定名称不可修改，二级名称同时也是目录名称，会按先后顺序匹配，匹配后程序会按这个名称建立二级目录
+# 3. 支持的分类条件：
+#   `original_language` 语种，具体含义参考下方字典
+#   `production_countries` 国家或地区（电影）、`origin_country` 国家或地区（电视剧），具体含义参考下方字典
+#   `genre_ids` 内容类型，具体含义参考下方字典
+#   `release_year` 发行年份，格式：YYYY，电影实际对应`release_date`字段，电视剧实际对应`first_air_date`字段，支持范围设定，如：`YYYY-YYYY`
+#   themoviedb 详情API返回的其它一级字段
+# 4. 配置多项条件时需要同时满足，一个条件需要匹配多个值是使用`,`分隔
+# 5. !条件值表示排除该值
+
+"""
 
 
-class CategoryHelper(metaclass=Singleton):
+class CategoryHelper(metaclass=WeakSingleton):
     """
     二级分类
     """
-    _categorys = {}
-    _movie_categorys = {}
-    _tv_categorys = {}
 
     def __init__(self):
         self._category_path: Path = settings.CONFIG_PATH / "category.yaml"
+        self._categorys = {}
+        self._movie_categorys = {}
+        self._tv_categorys = {}
         self.init()
 
     def init(self):
@@ -29,10 +44,10 @@ class CategoryHelper(metaclass=Singleton):
         try:
             if not self._category_path.exists():
                 shutil.copy(settings.INNER_CONFIG_PATH / "category.yaml", self._category_path)
-            with open(self._category_path, mode='r', encoding='utf-8') as f:
+            with open(self._category_path, mode='r', encoding='utf-8', errors='replace') as f:
                 try:
-                    yaml = ruamel.yaml.YAML()
-                    self._categorys = yaml.load(f)
+                    yaml_loader = ruamel.yaml.YAML()
+                    self._categorys = yaml_loader.load(f)
                 except Exception as e:
                     logger.warn(f"二级分类策略配置文件格式出现严重错误！请检查：{str(e)}")
                     self._categorys = {}
@@ -43,6 +58,40 @@ class CategoryHelper(metaclass=Singleton):
             self._movie_categorys = self._categorys.get('movie')
             self._tv_categorys = self._categorys.get('tv')
         logger.info(f"已加载二级分类策略 category.yaml")
+
+    def load(self) -> CategoryConfig:
+        """
+        加载配置
+        """
+        config = CategoryConfig()
+        if not self._category_path.exists():
+            return config
+        try:
+            with open(self._category_path, 'r', encoding='utf-8', errors='replace') as f:
+                yaml_loader = ruamel.yaml.YAML()
+                data = yaml_loader.load(f)
+                if data:
+                    config = CategoryConfig(**data)
+        except Exception as e:
+            logger.error(f"Load category config failed: {e}")
+        return config
+
+    def save(self, config: CategoryConfig) -> bool:
+        """
+        保存配置
+        """
+        data = config.model_dump(exclude_none=True)
+        try:
+            with open(self._category_path, 'w', encoding='utf-8') as f:
+                f.write(HEADER_COMMENTS)
+                yaml_dumper = ruamel.yaml.YAML()
+                yaml_dumper.dump(data, f)
+            # 保存后重新加载配置
+            self.init()
+            return True
+        except Exception as e:
+            logger.error(f"Save category config failed: {e}")
+            return False
 
     @property
     def is_movie_category(self) -> bool:
@@ -69,7 +118,7 @@ class CategoryHelper(metaclass=Singleton):
         """
         if not self._movie_categorys:
             return []
-        return self._movie_categorys.keys()
+        return list(self._movie_categorys.keys())
 
     @property
     def tv_categorys(self) -> list:
@@ -78,7 +127,7 @@ class CategoryHelper(metaclass=Singleton):
         """
         if not self._tv_categorys:
             return []
-        return self._tv_categorys.keys()
+        return list(self._tv_categorys.keys())
 
     def get_movie_category(self, tmdb_info) -> str:
         """
@@ -108,6 +157,7 @@ class CategoryHelper(metaclass=Singleton):
             return ""
         if not categorys:
             return ""
+
         for key, item in categorys.items():
             if not item:
                 return key
@@ -127,30 +177,48 @@ class CategoryHelper(metaclass=Singleton):
                     continue
                 elif attr == "production_countries":
                     # 制片国家
-                    info_values = [str(val.get("iso_3166_1")).upper() for val in info_value]
+                    info_values = [str(val.get("iso_3166_1")).upper() for val in info_value]  # type: ignore
                 else:
                     if isinstance(info_value, list):
                         info_values = [str(val).upper() for val in info_value]
                     else:
                         info_values = [str(info_value).upper()]
 
-                if value.find(",") != -1:
-                    # , 分隔多个值
-                    values = [str(val).upper() for val in value.split(",") if val]
-                elif value.find("-") != -1:
-                    # - 表示范围，仅限于数字
-                    value_begin = value.split("-")[0]
-                    value_end = value.split("-")[1]
+                values = []
+                invert_values = []
+
+                # 如果有 "," 进行分割
+                values = [str(val) for val in value.split(",") if val]
+
+                expanded_values = []
+                for v in values:
+                    if "-" not in v:
+                        expanded_values.append(v)
+                        continue
+
+                    # - 表示范围
+                    value_begin, value_end = v.split("-", 1)
+
+                    prefix = ""
+                    if value_begin.startswith('!'):
+                        prefix = '!'
+                        value_begin = value_begin[1:]
+
                     if value_begin.isdigit() and value_end.isdigit():
                         # 数字范围
-                        values = [str(val) for val in range(int(value_begin), int(value_end) + 1)]
+                        expanded_values.extend(f"{prefix}{val}" for val in range(int(value_begin), int(value_end) + 1))
                     else:
                         # 字符串范围
-                        values = [str(value_begin), str(value_end)]
-                else:
-                    values = [str(value).upper()]
+                        expanded_values.extend([f"{prefix}{value_begin}", f"{prefix}{value_end}"])
 
-                if not set(values).intersection(set(info_values)):
+                values = list(map(str.upper, expanded_values))
+
+                invert_values = [val[1:] for val in values if val.startswith('!')]
+                values = [val for val in values if not val.startswith('!')]
+
+                if values and not set(values).intersection(set(info_values)):
+                    match_flag = False
+                if invert_values and set(invert_values).intersection(set(info_values)):
                     match_flag = False
             if match_flag:
                 return key

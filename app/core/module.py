@@ -16,14 +16,14 @@ class ModuleManager(metaclass=Singleton):
     模块管理器
     """
 
-    # 模块列表
-    _modules: dict = {}
-    # 运行态模块列表
-    _running_modules: dict = {}
     # 子模块类型集合
     SubType = Union[DownloaderType, MediaServerType, MessageChannel, StorageSchema, OtherModulesType]
 
     def __init__(self):
+        # 模块列表
+        self._modules: dict = {}
+        # 运行态模块列表
+        self._running_modules: dict = {}
         self.load_modules()
 
     def load_modules(self):
@@ -48,7 +48,7 @@ class ModuleManager(metaclass=Singleton):
                     # 通过模板开关控制加载
                     _module.init_module()
                     self._running_modules[module_id] = _module
-                    logger.info(f"Moudle Loaded：{module_id}")
+                    logger.debug(f"Moudle Loaded：{module_id}")
             except Exception as err:
                 logger.error(f"Load Moudle Error：{module_id}，{str(err)} - {traceback.format_exc()}", exc_info=True)
 
@@ -58,12 +58,11 @@ class ModuleManager(metaclass=Singleton):
         """
         logger.info("正在停止所有模块...")
         for module_id, module in self._running_modules.items():
-            if hasattr(module, "stop"):
-                try:
-                    module.stop()
-                    logger.info(f"Moudle Stoped：{module_id}")
-                except Exception as err:
-                    logger.error(f"Stop Moudle Error：{module_id}，{str(err)} - {traceback.format_exc()}", exc_info=True)
+            try:
+                module.stop()
+                logger.debug(f"Moudle Stoped：{module_id}")
+            except Exception as err:
+                logger.error(f"Stop Moudle Error：{module_id}，{str(err)} - {traceback.format_exc()}", exc_info=True)
         logger.info("所有模块停止完成")
 
     def reload(self):

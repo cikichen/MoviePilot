@@ -1,5 +1,6 @@
 import secrets
-from typing import Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Literal, Optional, Tuple, Union
 
 from app.chain import ChainBase
 from app.core.config import settings
@@ -11,7 +12,17 @@ from app.schemas import AuthCredentials, AuthInterceptCredentials
 from app.schemas.types import ChainEventType
 from app.utils.otp import OtpUtils
 
-PASSWORD_INVALID_CREDENTIALS_MESSAGE = "用户名或密码或二次校验码不正确"
+PASSWORD_INVALID_CREDENTIALS_MESSAGE = "用户名、密码或验证码错误"
+
+
+MfaMethod = Literal["otp"]
+
+
+@dataclass(frozen=True)
+class MfaRequired:
+    """密码验证通过后，当前账号仍需完成的二次验证要求。"""
+
+    methods: Tuple[MfaMethod, ...]
 
 
 class UserChain(ChainBase):
@@ -26,7 +37,7 @@ class UserChain(ChainBase):
             mfa_code: Optional[str] = None,
             code: Optional[str] = None,
             grant_type: Optional[str] = "password"
-    ) -> Union[Tuple[bool, Optional[str]], Tuple[bool, Optional[User]]]:
+    ) -> Tuple[bool, Union[str, User, MfaRequired, None]]:
         """
         认证用户，根据不同的 grant_type 处理不同的认证流程
 
@@ -51,8 +62,11 @@ class UserChain(ChainBase):
             # Password 认证
             success, user_or_message = self.password_authenticate(credentials=credentials)
             if success:
-                # 如果用户启用了二次验证码，则进一步验证
-                if not self._verify_mfa(user_or_message, credentials.mfa_code):
+                # 如果用户启用了二次验证，则进一步验证
+                mfa_result = self._verify_mfa(user_or_message, credentials.mfa_code)
+                if isinstance(mfa_result, MfaRequired):
+                    return False, mfa_result
+                if not mfa_result:
                     return False, PASSWORD_INVALID_CREDENTIALS_MESSAGE
                 logger.info(f"用户 {username} 通过密码认证成功")
                 return True, user_or_message
@@ -62,8 +76,11 @@ class UserChain(ChainBase):
                     logger.warning("密码认证失败，尝试通过外部服务进行辅助认证 ...")
                     aux_success, aux_user_or_message = self.auxiliary_authenticate(credentials=credentials)
                     if aux_success:
-                        # 辅助认证成功后再验证二次验证码
-                        if not self._verify_mfa(aux_user_or_message, credentials.mfa_code):
+                        # 辅助认证成功后再验证 6 位验证码
+                        mfa_result = self._verify_mfa(aux_user_or_message, credentials.mfa_code)
+                        if isinstance(mfa_result, MfaRequired):
+                            return False, mfa_result
+                        if not mfa_result:
                             return False, PASSWORD_INVALID_CREDENTIALS_MESSAGE
                         return True, aux_user_or_message
                     else:
@@ -159,19 +176,24 @@ class UserChain(ChainBase):
             return False, PASSWORD_INVALID_CREDENTIALS_MESSAGE
 
     @staticmethod
-    def _verify_mfa(user: User, mfa_code: Optional[str]) -> bool:
+    def _verify_mfa(user: User, mfa_code: Optional[str]) -> Union[bool, MfaRequired]:
         """
-        验证 MFA（二次验证码）
+        验证密码登录后的 6 位验证码。
 
         :param user: 用户对象
-        :param mfa_code: 二次验证码
-        :return: 如果验证成功返回 True，否则返回 False
+        :param mfa_code: 身份验证器生成的 6 位验证码
+        :return:
+            - 如果验证成功返回 True
+            - 如果需要 MFA 但未提供，返回当前账号实际可用的验证方式
+            - 如果MFA验证失败，返回 False
         """
         if not user.is_otp:
             return True
+
         if not mfa_code:
-            logger.info(f"用户 {user.name} 缺少 MFA 认证码")
-            return False
+            logger.info(f"用户 {user.name} 已启用二次验证，需要提供验证码")
+            return MfaRequired(methods=("otp",))
+
         if not OtpUtils.check(str(user.otp_secret), mfa_code):
             logger.info(f"用户 {user.name} 的 MFA 认证失败")
             return False

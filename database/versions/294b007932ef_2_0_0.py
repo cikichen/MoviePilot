@@ -1,7 +1,7 @@
 """2.0.0
 
 Revision ID: 294b007932ef
-Revises: 
+Revises:
 Create Date: 2024-07-20 08:43:40.741251
 
 """
@@ -31,13 +31,16 @@ def upgrade() -> None:
         # 初始化超级管理员
         _user = User.get_by_name(db=db, name=settings.SUPERUSER)
         if not _user:
-            # 生成随机密码
-            random_password = secrets.token_urlsafe(16)
-            logger.info(
-                f"【超级管理员初始密码】{random_password} 请登录系统后在设定中修改。 注：该密码只会显示一次，请注意保存。")
+            if settings.SUPERUSER_PASSWORD:
+                init_password = settings.SUPERUSER_PASSWORD
+            else:
+                # 生成随机密码
+                init_password = secrets.token_urlsafe(16)
+                logger.info(
+                    f"【超级管理员初始密码】{init_password} 请登录系统后在设定中修改。 注：该密码只会显示一次，请注意保存。")
             _user = User(
                 name=settings.SUPERUSER,
-                hashed_password=get_password_hash(random_password),
+                hashed_password=get_password_hash(init_password),
                 email="admin@movie-pilot.org",
                 is_superuser=True,
                 avatar=""

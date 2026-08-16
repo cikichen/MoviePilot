@@ -3,12 +3,12 @@ import traceback
 from typing import List, Tuple, Union, Optional
 from urllib.parse import urljoin
 
-import chardet
 from lxml import etree
 
 from app.core.config import settings
 from app.helper.browser import PlaywrightHelper
 from app.log import logger
+from app.utils import rust_accel
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
@@ -227,14 +227,31 @@ class RssHelper:
         },
     }
 
+    def __parse_with_rust(self, ret_xml: Optional[str]) -> Optional[list]:
+        """
+        调用 Rust RSS 解析器，并统一处理基础 XML 校验和最大条目限制。
+        """
+        if not ret_xml or not ret_xml.strip():
+            return None
+        ret_xml_stripped = ret_xml.strip()
+        if not ret_xml_stripped.startswith('<'):
+            return None
+        rust_items = rust_accel.parse_rss_items(ret_xml, self.MAX_RSS_ITEMS + 1)
+        if rust_items is None:
+            return None
+        if len(rust_items) > self.MAX_RSS_ITEMS:
+            logger.warning(f"RSS条目过多: 超过{self.MAX_RSS_ITEMS}，仅处理前{self.MAX_RSS_ITEMS}个")
+        return rust_items[:self.MAX_RSS_ITEMS]
+
     def parse(self, url, proxy: bool = False,
-              timeout: Optional[int] = 15, headers: dict = None) -> Union[List[dict], None, bool]:
+              timeout: Optional[int] = 15, headers: dict = None, ua: str = None) -> Union[List[dict], None, bool]:
         """
         解析RSS订阅URL，获取RSS中的种子信息
         :param url: RSS地址
         :param proxy: 是否使用代理
         :param timeout: 请求超时
         :param headers: 自定义请求头
+        :param ua: 自定义User-Agent
         :return: 种子信息列表，如为None代表Rss过期，如果为False则为错误
         """
         # 开始处理
@@ -243,15 +260,21 @@ class RssHelper:
             return False
 
         try:
-            ret = RequestUtils(proxies=settings.PROXY if proxy else None,
-                               timeout=timeout, headers=headers).get_res(url)
+            ret = RequestUtils(ua=ua,
+                               proxies=settings.PROXY if proxy else None,
+                               timeout=timeout or 30, headers=headers).get_res(url)
             if not ret:
+                logger.error(f"获取RSS失败：请求返回空值，URL: {url}")
                 return False
         except Exception as err:
             logger.error(f"获取RSS失败：{str(err)} - {traceback.format_exc()}")
             return False
 
         if ret:
+            # 检查HTTP状态码
+            if ret.status_code != 200:
+                logger.error(f"RSS请求失败，状态码: {ret.status_code}, URL: {url}")
+                return False
             ret_xml = None
             root = None
             try:
@@ -262,23 +285,31 @@ class RssHelper:
                     return False
 
                 if raw_data:
-                    try:
-                        result = chardet.detect(raw_data)
-                        encoding = result['encoding']
-                        # 解码为字符串
-                        ret_xml = raw_data.decode(encoding)
-                    except Exception as e:
-                        logger.debug(f"chardet解码失败：{str(e)}")
-                        # 探测utf-8解码
-                        match = re.search(r'encoding\s*=\s*["\']([^"\']+)["\']', ret.text)
-                        if match:
-                            encoding = match.group(1)
-                            if encoding:
-                                ret_xml = raw_data.decode(encoding)
-                        else:
-                            ret.encoding = ret.apparent_encoding
+                    ret_xml = RequestUtils.get_decoded_xml_content(
+                        ret,
+                        performance_mode=settings.ENCODING_DETECTION_PERFORMANCE_MODE,
+                        confidence_threshold=settings.ENCODING_DETECTION_MIN_CONFIDENCE
+                    )
+                    rust_items = self.__parse_with_rust(ret_xml)
+                    if rust_items is not None:
+                        return rust_items
                 if not ret_xml:
                     ret_xml = ret.text
+
+                # 验证RSS内容是否有效
+                if not ret_xml or not ret_xml.strip():
+                    logger.error("RSS内容为空")
+                    return False
+
+                # 检查是否包含基本的RSS/XML结构
+                ret_xml_stripped = ret_xml.strip()
+                if not ret_xml_stripped.startswith('<'):
+                    logger.error("RSS内容不是有效的XML格式")
+                    return False
+
+                rust_items = self.__parse_with_rust(ret_xml)
+                if rust_items is not None:
+                    return rust_items
 
                 # 使用lxml.etree解析XML
                 parser = None
@@ -292,7 +323,8 @@ class RssHelper:
                         huge_tree=False  # 禁用大文档解析，避免内存问题
                     )
                     root = etree.fromstring(ret_xml.encode('utf-8'), parser=parser)
-                except etree.XMLSyntaxError:
+                except etree.XMLSyntaxError as xml_error:
+                    logger.debug(f"XML解析失败：{str(xml_error)}，尝试HTML解析")
                     # 如果XML解析失败，尝试作为HTML解析
                     try:
                         root = etree.HTML(ret_xml)
@@ -304,9 +336,15 @@ class RssHelper:
                     except Exception as e:
                         logger.error(f"HTML解析也失败：{str(e)}")
                         return False
+                except Exception as general_error:
+                    logger.error(f"解析RSS时发生未预期错误：{str(general_error)}")
+                    return False
                 finally:
                     if parser is not None:
-                        parser.close()
+                        try:
+                            parser.close()
+                        except Exception as close_error:
+                            logger.debug(f"关闭解析器时出错：{str(close_error)}")
                         del parser
 
                 if root is None:
@@ -357,10 +395,16 @@ class RssHelper:
                                     size = int(size_attr)
 
                             # 发布日期
-                            pubdate_nodes = item.xpath('.//pubDate | .//published | .//updated')
+                            pubdate_nodes = item.xpath('./pubDate | ./published | ./updated')
+                            if not pubdate_nodes:
+                                pubdate_nodes = item.xpath('.//*[local-name()="pubDate"] | .//*[local-name()="published"] | .//*[local-name()="updated"]')
+
                             pubdate = ""
                             if pubdate_nodes and pubdate_nodes[0].text:
                                 pubdate = StringUtils.get_time(pubdate_nodes[0].text)
+                                if pubdate is not None:
+                                    # 转为本地时区
+                                    pubdate = pubdate.astimezone(tz=None)
 
                             # 获取豆瓣昵称
                             nickname_nodes = item.xpath('.//*[local-name()="creator"]')
@@ -406,13 +450,14 @@ class RssHelper:
 
         return ret_array
 
-    def get_rss_link(self, url: str, cookie: str, ua: str, proxy: bool = False) -> Tuple[str, str]:
+    def get_rss_link(self, url: str, cookie: str, ua: str, proxy: bool = False, timeout: int = None) -> Tuple[str, str]:
         """
         获取站点rss地址
         :param url: 站点地址
         :param cookie: 站点cookie
         :param ua: 站点ua
         :param proxy: 是否使用代理
+        :param timeout: 请求超时时间
         :return: rss地址、错误信息
         """
         try:
@@ -430,12 +475,13 @@ class RssHelper:
                     url=rss_url,
                     cookies=cookie,
                     ua=ua,
-                    proxies=settings.PROXY if proxy else None
+                    proxies=settings.PROXY_SERVER if proxy else None,
+                    timeout=timeout or 60
                 )
             else:
                 res = RequestUtils(
                     cookies=cookie,
-                    timeout=60,
+                    timeout=timeout or 30,
                     ua=ua,
                     proxies=settings.PROXY if proxy else None
                 ).post_res(url=rss_url, data=rss_params)

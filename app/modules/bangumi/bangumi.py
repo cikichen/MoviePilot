@@ -5,12 +5,14 @@ import requests
 
 from app.core.cache import cached
 from app.core.config import settings
-from app.utils.http import RequestUtils
+from app.utils.http import RequestUtils, AsyncRequestUtils
 
 
 class BangumiApi(object):
     """
-    https://bangumi.github.io/api/
+    Bangumi API客户端。
+
+    接口文档：https://bangumi.github.io/api/
     """
 
     _urls = {
@@ -28,9 +30,17 @@ class BangumiApi(object):
 
     def __init__(self):
         self._session = requests.Session()
-        self._req = RequestUtils(session=self._session)
+        self._req = RequestUtils(
+            ua=settings.NORMAL_USER_AGENT,
+            proxies=settings.PROXY,
+            session=self._session,
+        )
+        self._async_req = AsyncRequestUtils(
+            ua=settings.NORMAL_USER_AGENT,
+            proxies=settings.PROXY,
+        )
 
-    @cached(maxsize=settings.CONF.bangumi, ttl=settings.CONF.meta)
+    @cached(maxsize=settings.CONF.bangumi, ttl=settings.CONF.meta, shared_key="get")
     def __invoke(self, url, key: Optional[str] = None, **kwargs):
         req_url = self._base_url + url
         params = {}
@@ -38,7 +48,23 @@ class BangumiApi(object):
             params.update(kwargs)
         resp = self._req.get_res(url=req_url, params=params)
         try:
-            if not resp:
+            if resp is None or resp.status_code != 200:
+                return None
+            result = resp.json()
+            return result.get(key) if key else result
+        except Exception as e:
+            print(e)
+            return None
+
+    @cached(maxsize=settings.CONF.bangumi, ttl=settings.CONF.meta, shared_key="get")
+    async def __async_invoke(self, url, key: Optional[str] = None, **kwargs):
+        req_url = self._base_url + url
+        params = {}
+        if kwargs:
+            params.update(kwargs)
+        resp = await self._async_req.get_res(url=req_url, params=params)
+        try:
+            if resp is None or resp.status_code != 200:
                 return None
             result = resp.json()
             return result.get(key) if key else result
@@ -51,6 +77,15 @@ class BangumiApi(object):
         搜索媒体信息
         """
         result = self.__invoke("search/subject/%s" % name)
+        if result:
+            return result.get("list")
+        return []
+
+    async def async_search(self, name):
+        """
+        搜索媒体信息（异步版本）
+        """
+        result = await self.__async_invoke("search/subject/%s" % name)
         if result:
             return result.get("list")
         return []
@@ -153,11 +188,28 @@ class BangumiApi(object):
                 ret_list.extend(item.get("items") or [])
         return ret_list
 
+    async def async_calendar(self):
+        """
+        获取每日放送，返回items（异步版本）
+        """
+        ret_list = []
+        result = await self.__async_invoke(self._urls["calendar"], _ts=datetime.strftime(datetime.now(), '%Y%m%d'))
+        if result:
+            for item in result:
+                ret_list.extend(item.get("items") or [])
+        return ret_list
+
     def detail(self, bid: int):
         """
         获取番剧详情
         """
         return self.__invoke(self._urls["detail"] % bid, _ts=datetime.strftime(datetime.now(), '%Y%m%d'))
+
+    async def async_detail(self, bid: int):
+        """
+        获取番剧详情（异步版本）
+        """
+        return await self.__async_invoke(self._urls["detail"] % bid, _ts=datetime.strftime(datetime.now(), '%Y%m%d'))
 
     def credits(self, bid: int):
         """
@@ -175,17 +227,47 @@ class BangumiApi(object):
                     ret_list.append(actor_info)
         return ret_list
 
+    async def async_credits(self, bid: int):
+        """
+        获取番剧人物（异步版本）
+        """
+        ret_list = []
+        result = await self.__async_invoke(self._urls["characters"] % bid,
+                                           _ts=datetime.strftime(datetime.now(), '%Y%m%d'))
+        if result:
+            for item in result:
+                character_id = item.get("id")
+                actors = item.get("actors")
+                if character_id and actors and actors[0]:
+                    actor_info = actors[0]
+                    actor_info.update({'career': [item.get('name')]})
+                    ret_list.append(actor_info)
+        return ret_list
+
     def subjects(self, bid: int):
         """
         获取关联条目信息
         """
         return self.__invoke(self._urls["subjects"] % bid, _ts=datetime.strftime(datetime.now(), '%Y%m%d'))
 
+    async def async_subjects(self, bid: int):
+        """
+        获取关联条目信息（异步版本）
+        """
+        return await self.__async_invoke(self._urls["subjects"] % bid, _ts=datetime.strftime(datetime.now(), '%Y%m%d'))
+
     def person_detail(self, person_id: int):
         """
         获取人物详细信息
         """
         return self.__invoke(self._urls["person_detail"] % person_id, _ts=datetime.strftime(datetime.now(), '%Y%m%d'))
+
+    async def async_person_detail(self, person_id: int):
+        """
+        获取人物详细信息（异步版本）
+        """
+        return await self.__async_invoke(self._urls["person_detail"] % person_id,
+                                         _ts=datetime.strftime(datetime.now(), '%Y%m%d'))
 
     def person_credits(self, person_id: int):
         """
@@ -199,6 +281,18 @@ class BangumiApi(object):
                 ret_list.append(item)
         return ret_list
 
+    async def async_person_credits(self, person_id: int):
+        """
+        获取人物参演作品（异步版本）
+        """
+        ret_list = []
+        result = await self.__async_invoke(self._urls["person_credits"] % person_id,
+                                           _ts=datetime.strftime(datetime.now(), '%Y%m%d'))
+        if result:
+            for item in result:
+                ret_list.append(item)
+        return ret_list
+
     def discover(self, **kwargs):
         """
         发现
@@ -207,6 +301,23 @@ class BangumiApi(object):
                              key="data",
                              _ts=datetime.strftime(datetime.now(), '%Y%m%d'), **kwargs)
 
-    def close(self):
+    async def async_discover(self, **kwargs):
+        """
+        发现（异步版本）
+        """
+        return await self.__async_invoke(self._urls["discover"],
+                                         key="data",
+                                         _ts=datetime.strftime(datetime.now(), '%Y%m%d'), **kwargs)
+
+    def clear_cache(self):
+        """
+        清除缓存
+        """
+        self.__invoke.cache_clear()
+
+    def close(self) -> None:
+        """
+        关闭Bangumi会话
+        """
         if self._session:
             self._session.close()

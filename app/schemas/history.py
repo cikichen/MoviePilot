@@ -1,9 +1,13 @@
 from typing import Optional, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DownloadHistory(BaseModel):
+    """
+    下载历史记录
+    """
+
     # ID
     id: int
     # 保存路程
@@ -22,12 +26,22 @@ class DownloadHistory(BaseModel):
     tvdbid: Optional[int] = None
     # 豆瓣ID
     doubanid: Optional[str] = None
+    # Bangumi ID
+    bangumiid: Optional[int] = None
+    # AniList ID
+    anilistid: Optional[int] = None
+    # 媒体数据源
+    media_source: Optional[str] = None
+    # 数据源原生ID
+    media_id: Optional[str] = None
     # 季Sxx
     seasons: Optional[str] = None
     # 集Exx
     episodes: Optional[str] = None
-    # 海报
+    # 背景图
     image: Optional[str] = None
+    # 海报
+    poster: Optional[str] = None
     # 下载器Hash
     download_hash: Optional[str] = None
     # 种子名称
@@ -51,11 +65,14 @@ class DownloadHistory(BaseModel):
     # 自定义剧集组
     episode_group: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TransferHistory(BaseModel):
+    """
+    文件整理历史记录
+    """
+
     # ID
     id: int
     # 源目录
@@ -80,6 +97,14 @@ class TransferHistory(BaseModel):
     tvdbid: Optional[int] = None
     # 豆瓣ID
     doubanid: Optional[str] = None
+    # Bangumi ID
+    bangumiid: Optional[int] = None
+    # AniList ID
+    anilistid: Optional[int] = None
+    # 媒体数据源
+    media_source: Optional[str] = None
+    # 数据源原生ID
+    media_id: Optional[str] = None
     # 季Sxx
     seasons: Optional[str] = None
     # 集Exx
@@ -97,5 +122,8 @@ class TransferHistory(BaseModel):
     # 日期
     date: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BatchTransferHistoryRedoRequest(BaseModel):
+    history_ids: list[int] = Field(default_factory=list)

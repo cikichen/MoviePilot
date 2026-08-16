@@ -5,26 +5,31 @@ import app.modules.trimemedia.api as fnapi
 from app import schemas
 from app.log import logger
 from app.schemas import MediaType
+from app.utils.security import SecurityUtils
 from app.utils.url import UrlUtils
 
 
 class TrimeMedia:
     _username: Optional[str] = None
     _password: Optional[str] = None
+    _access_code: Optional[str] = None
 
     _userinfo: Optional[fnapi.User] = None
+    _host: Optional[str] = None
     _playhost: Optional[str] = None
 
     _libraries: dict[str, fnapi.MediaDb] = {}
     _sync_libraries: List[str] = []
 
     _api: Optional[fnapi.Api] = None
+    _version: Optional[fnapi.Version] = None
 
     def __init__(
         self,
         host: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        access_code: Optional[str] = None,
         play_host: Optional[str] = None,
         sync_libraries: Optional[list] = None,
         **kwargs,
@@ -34,19 +39,19 @@ class TrimeMedia:
             return
         self._username = username
         self._password = password
+        self._access_code = access_code
+        self._host = host
         self._sync_libraries = sync_libraries or []
 
-        if (api := self.__create_api(host)) is None:
+        if not self.reconnect():
             logger.error(f"请检查服务端地址 {host}")
             return
-        self._api = api
-        if play_api := self.__create_api(play_host):
-            self._playhost = play_api.host
+        if result := self.__create_api(play_host, access_code):
+            self._playhost = result.api.host
+            result.api.close()
         elif play_host:
             logger.warning(f"请检查外网播放地址 {play_host}")
             self._playhost = UrlUtils.standardize_base_url(play_host).rstrip("/")
-
-        self.reconnect()
 
     @property
     def api(self) -> Optional[fnapi.Api]:
@@ -55,14 +60,29 @@ class TrimeMedia:
         """
         return self._api
 
+    @property
+    def version(self) -> Optional[fnapi.Version]:
+        """
+        获得飞牛API的版本
+        """
+        return self._version
+
+    class _ApiCreateResult:
+        api: fnapi.Api
+        version: fnapi.Version
+
     @staticmethod
-    def __create_api(host: Optional[str]) -> Optional[fnapi.Api]:
+    def __create_api(
+        host: Optional[str], access_code: Optional[str] = None
+    ) -> Optional["TrimeMedia._ApiCreateResult"]:
         """
         创建一个飞牛API
 
         :param host:  服务端地址
+        :param access_code: 访问码，未开启时为空
         :return: 如果地址无效、不可访问则返回None
         """
+
         if not host:
             return None
         api_key = "16CCEB3D-AB42-077D-36A1-F355324E4237"
@@ -70,21 +90,38 @@ class TrimeMedia:
 
         if not host.endswith("/v"):
             # 尝试补上结尾的/v 测试能否正常访问
-            api = fnapi.Api(host + "/v", api_key)
-            if api.sys_version():
-                return api
+            res = TrimeMedia._ApiCreateResult()
+            res.api = fnapi.Api(host + "/v", api_key, access_code)
+            # 开启访问码后，需先校验才能访问各应用接口
+            if res.api.verify_access_code() and (fnver := res.api.sys_version()):
+                res.version = fnver
+                return res
+            res.api.close()
         # 测试用户配置的地址
-        api = fnapi.Api(host, api_key)
-        return api if api.sys_version() else None
+        res = TrimeMedia._ApiCreateResult()
+        res.api = fnapi.Api(host, api_key, access_code)
+        if res.api.verify_access_code() and (fnver := res.api.sys_version()):
+            res.version = fnver
+            return res
+        res.api.close()
+        return None
 
     def close(self):
         self.disconnect()
 
     def is_configured(self) -> bool:
-        return self._api is not None
+        return bool(self._host and self._username and self._password)
 
     def is_authenticated(self) -> bool:
-        return self.is_configured() and self._api.token is not None
+        """
+        是否已登录
+        """
+        return (
+            self.is_configured()
+            and self._api is not None
+            and self._api.token is not None
+            and self._userinfo is not None
+        )
 
     def is_inactive(self) -> bool:
         """
@@ -101,40 +138,52 @@ class TrimeMedia:
         """
         if not self.is_configured():
             return False
-        if (fnver := self._api.sys_version()) is None:
+        self.disconnect()
+        if result := self.__create_api(self._host, self._access_code):
+            self._api = result.api
+            self._version = result.version
+            # 版本号:0.8.53, 服务版本:0.8.23
+            # 版本号:0.8.56, 服务版本:0.8.23 接口/memory/user/list改为/manager/user/list
+            logger.debug(
+                f"版本号:{result.version.frontend}, 服务版本:{result.version.backend}"
+            )
+        else:
             return False
-        # 版本号:0.8.36, 服务版本:0.8.19
-        logger.debug(f"版本号:{fnver.frontend}, 服务版本:{fnver.backend}")
         if self._api.login(self._username, self._password) is None:
             return False
         self._userinfo = self._api.user_info()
         if self._userinfo is None:
             return False
         logger.debug(f"{self._username} 成功登录飞牛影视")
+        # 刷新媒体库列表
+        self.get_librarys()
         return True
 
     def disconnect(self):
         """
         断开与飞牛的连接
         """
-        if self.is_authenticated():
+        if self._api:
             self._api.logout()
             self._api.close()
+            self._api = None
             self._userinfo = None
             logger.debug(f"{self._username} 已断开飞牛影视")
 
     def get_librarys(
         self, hidden: Optional[bool] = False
-    ) -> List[schemas.MediaServerLibrary]:
+    ) -> Optional[List[schemas.MediaServerLibrary]]:
         """
         获取媒体服务器所有媒体库列表
         """
         if not self.is_authenticated():
-            return []
+            return None
         if self._userinfo.is_admin == 1:
-            mdb_list = self._api.mdb_list() or []
+            mdb_list = self._api.mdb_list()
         else:
-            mdb_list = self._api.mediadb_list() or []
+            mdb_list = self._api.mediadb_list()
+        if mdb_list is None:
+            return None
         self._libraries = {lib.guid: lib for lib in mdb_list}
         libraries = []
         for library in self._libraries.values():
@@ -156,11 +205,14 @@ class TrimeMedia:
                     name=library.name,
                     type=library_type,
                     path=library.dir_list,
+                    item_count=self.get_items_count(library.guid),
                     image_list=[
                         f"{self._api.host}{img_path}?w=256"
                         for img_path in library.posters or []
                     ],
                     link=f"{self._playhost or self._api.host}/library/{library.guid}",
+                    server_type="trimemedia",
+                    use_cookies=True,
                 )
             )
         return libraries
@@ -202,10 +254,12 @@ class TrimeMedia:
             return None
         if not self.is_configured():
             return None
-        feiniu = fnapi.Api(self._api.host, self._api.apikey)
-        if token := feiniu.login(username, password):
-            feiniu.logout()
-        return token
+        if result := self.__create_api(self._host):
+            try:
+                return result.api.login(username, password)
+            finally:
+                result.api.logout()
+                result.api.close()
 
     def get_movies(
         self, title: str, year: Optional[str] = None, tmdb_id: Optional[int] = None
@@ -265,12 +319,20 @@ class TrimeMedia:
         if not self.is_authenticated():
             return None, None
 
+        cached_item_id = item_id
         if not item_id:
             item_id = self.__get_series_id_by_name(title, year)
             if item_id is None:
                 return None, None
 
         item_info = self.get_iteminfo(item_id)
+        if not item_info and cached_item_id and title:
+            # 媒体删除后重新入库会导致缓存ID失效，回退到标题搜索避免误判整部剧缺失。
+            logger.warning(f"飞牛影视缓存的电视剧媒体ID {cached_item_id} 已失效，尝试按标题重新搜索：{title}")
+            item_id = self.__get_series_id_by_name(title, year)
+            if item_id is None:
+                return None, None
+            item_info = self.get_iteminfo(item_id)
         if not item_info:
             return None, {}
 
@@ -311,6 +373,8 @@ class TrimeMedia:
             logger.error("飞牛仅支持管理员账号刷新媒体库")
             return False
 
+        # 必须调用 否则容易误报 -14 Task duplicate
+        self._api.task_running()
         logger.info("刷新所有媒体库")
         return self._api.mdb_scanall()
 
@@ -337,6 +401,8 @@ class TrimeMedia:
             # 媒体库去重
             libraries.add(lib.guid)
 
+        # 必须调用 否则容易误报 -14 Task duplicate
+        self._api.task_running()
         for lib_guid in libraries:
             # 逐个刷新
             lib = self._libraries[lib_guid]
@@ -363,7 +429,7 @@ class TrimeMedia:
                     return lib
         return None
 
-    def get_webhook_message(self, body: any) -> Optional[schemas.WebhookEventInfo]:
+    def get_webhook_message(self, body: Any) -> Optional[schemas.WebhookEventInfo]:
         pass
 
     def get_iteminfo(self, itemid: str) -> Optional[schemas.MediaServerItem]:
@@ -452,6 +518,22 @@ class TrimeMedia:
                 if item.duration and item.ts is not None
                 else 0
             ),
+            server_type="trimemedia",
+            use_cookies=True,
+        )
+
+    def get_items_count(self, parent: Union[str, int]) -> Optional[int]:
+        """
+        获取指定媒体库可同步的媒体条目总数
+
+        :param parent: 媒体库ID
+        :return: 媒体条目总数，查询失败时返回None
+        """
+        if not self.is_authenticated():
+            return None
+        return self._api.item_count(
+            guid=str(parent),
+            types=[fnapi.Type.MOVIE, fnapi.Type.TV],
         )
 
     def get_items(
@@ -513,8 +595,11 @@ class TrimeMedia:
         """
         if not self.is_authenticated():
             return None
+        items = self._api.play_list()
+        if items is None:
+            return None
         ret_resume = []
-        for item in self._api.play_list() or []:
+        for item in items:
             if len(ret_resume) == num:
                 break
             if self.__is_library_blocked(item.ancestor_guid):
@@ -528,14 +613,13 @@ class TrimeMedia:
         """
         if not self.is_authenticated():
             return None
-        items = (
-            self._api.item_list(
-                page=1,
-                page_size=max(100, num * 5),
-                types=[fnapi.Type.MOVIE, fnapi.Type.TV],
-            )
-            or []
+        items = self._api.item_list(
+            page=1,
+            page_size=max(100, num * 5),
+            types=[fnapi.Type.MOVIE, fnapi.Type.TV],
         )
+        if items is None:
+            return None
         latest = []
         for item in items:
             if len(latest) == num:
@@ -568,6 +652,7 @@ class TrimeMedia:
             if (item_details := self._api.item(item.guid)) is None:
                 continue
             if remote:
+                # FIXME 新版飞牛的壁纸无法直接在浏览器中访问
                 img_host = self._playhost or self._api.host
             else:
                 img_host = self._api.host
@@ -596,3 +681,19 @@ class TrimeMedia:
             )
             else False
         )
+
+    def get_image_cookies(self, image_url: str):
+        """
+        获得指定图片的Cookies
+        """
+        if not self.is_authenticated():
+            return None
+        if not image_url or not SecurityUtils.is_safe_url(
+            image_url, [self._api.host], strict=True
+        ):
+            return None
+        cookies = {"Trim-MC-token": self._api.token}
+        if self._access_code:
+            # 开启访问码后，图片请求也需要携带访问码校验凭证
+            cookies.update(self._api.cookies)
+        return cookies
